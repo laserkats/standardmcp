@@ -7,6 +7,8 @@ end
 class Property < ActiveRecord::Base
   belongs_to :account
   has_many :photos
+
+  validates :name, presence: true
 end
 
 class Photo < ActiveRecord::Base

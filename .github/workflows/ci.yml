@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 10s
+          --health-timeout 5s --health-retries 5
+    env:
+      PGHOST: localhost
+      PGUSER: postgres
+    steps:
+      - uses: actions/checkout@v4
+      # NOTE: the Gemfile uses `gem "standardapi", path: "../standardapi"` for
+      # local development. That path does not exist in CI; switch the Gemfile
+      # to the git source before enabling this workflow.
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+      - run: bundle exec rake test

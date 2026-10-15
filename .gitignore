@@ -1,0 +1,10 @@
+/coverage
+/pkg
+/tmp
+*.gem
+.byebug_history
+test/standard_mcp/test_app/log
+*.log
+.DS_Store
+Gemfile.lock
+.bundle

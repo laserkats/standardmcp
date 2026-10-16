@@ -46,8 +46,8 @@ class PreviewTest < ActiveSupport::TestCase
     result = preview
     printed = JSON.parse(@io.string)
 
-    assert_equal %w[instructions tools], printed.keys
-    assert_equal %w[calculate_accounts get_account get_property list_accounts list_properties], printed['tools'].map { |t| t['name'] }.sort
+    assert_equal %w[instructions tools resourceTemplates], printed.keys
+    assert_equal %w[calculate_accounts describe get_account get_property list_accounts list_properties], printed['tools'].map { |t| t['name'] }.sort
     assert_equal StandardMCP::Tools.for(preview_request).map(&:to_h).map { |t| JSON.parse(JSON.generate(t)) }, printed['tools']
     assert_includes printed['instructions'], 'Resources:'
     assert_equal printed['tools'].size, result[:tools].size
@@ -63,7 +63,69 @@ class PreviewTest < ActiveSupport::TestCase
     tool = StandardMCP::Tools.for(preview_request).find { |t| t.name_value == 'list_accounts' }
     assert_equal JSON.generate(tool.to_h).length, size
 
-    assert_match(/\A5 tools, \d+ characters \(instructions: \d+ characters\)\z/, lines.last)
+    assert_match(/\A6 tools, \d+ characters \(instructions: \d+ characters\)\z/, lines[-2])
+  end
+
+  test "json carries the resource templates as resources/templates/list does" do
+    result = preview
+    printed = JSON.parse(@io.string)
+
+    assert_equal %w[standardmcp://schema/{resource} standardmcp://accounts/{id} standardmcp://properties/{id}].sort,
+      printed['resourceTemplates'].map { |t| t['uriTemplate'] }.sort
+    assert_equal 'application/json', printed['resourceTemplates'].first['mimeType']
+    assert_equal printed['resourceTemplates'].size, result[:resource_templates].size
+  end
+
+  test "summary ends with a line for the resource templates" do
+    preview(format: 'summary')
+
+    line = @io.string.lines.last.chomp
+    assert_match(/\A3 resource templates, \d+ characters: /, line)
+    assert_includes line, 'standardmcp://schema/{resource}'
+    assert_includes line, 'standardmcp://accounts/{id}'
+  end
+
+  test "no templates, no summary line for them" do
+    StandardMCP.config.resources = []
+    preview(format: 'summary')
+
+    refute_includes @io.string, 'resource template'
+    assert_equal [], preview[:resource_templates]
+  end
+
+  test "a single tool leaves the templates out" do
+    preview(tool: 'get_account', format: 'summary')
+
+    refute_includes @io.string, 'resource template'
+  end
+
+  # --- URI
+
+  test "URI prints what reading it returns" do
+    result = preview(uri: 'standardmcp://schema/accounts')
+    printed = JSON.parse(@io.string)
+
+    assert_equal 'accounts', printed['resource']
+    assert_includes printed['columns'].map { |c| c['name'] }, 'name'
+    assert_equal 'standardmcp://schema/accounts', result[:contents][:uri]
+  end
+
+  test "URI reads a record as the caller" do
+    account = create(:account, name: 'Acme')
+    other = create(:account)
+
+    preview(uri: "standardmcp://accounts/#{account.id}", headers: "Authorization: Bearer #{account.id}")
+    assert_equal 'Acme', JSON.parse(@io.string)['name']
+
+    error = assert_raises(ArgumentError) { preview(uri: "standardmcp://accounts/#{other.id}", headers: "Authorization: Bearer #{account.id}") }
+    assert_equal "Resource not found: standardmcp://accounts/#{other.id}", error.message
+  end
+
+  test "URI of something hidden or unknown is not found" do
+    ['standardmcp://schema/contacts', 'standardmcp://nothing/1', 'elsewhere://x/1'].each do |uri|
+      error = assert_raises(ArgumentError) { preview(uri: uri) }
+      assert_equal "Resource not found: #{uri}", error.message
+    end
   end
 
   test "an unknown format is refused" do
@@ -121,7 +183,7 @@ class PreviewTest < ActiveSupport::TestCase
     StandardMCP::Registry.stubs(:controllers).returns([PreviewBearerController])
 
     assert_empty preview[:tools]
-    assert_equal %w[list_preview_bearer], preview(headers: 'Authorization: Bearer 7')[:tools].map { |t| t[:name] }
+    assert_equal %w[describe list_preview_bearer], preview(headers: 'Authorization: Bearer 7')[:tools].map { |t| t[:name] }.sort
   end
 
   test "the configured instructions are previewed" do

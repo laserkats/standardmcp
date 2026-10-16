@@ -18,12 +18,14 @@ module StandardMCP
   autoload :Instructions, 'standard_mcp/instructions'
   autoload :Lint, 'standard_mcp/lint'
   autoload :Preview, 'standard_mcp/preview'
+  autoload :Resources, 'standard_mcp/resources'
   autoload :Tools, 'standard_mcp/tools'
   autoload :Endpoint, 'standard_mcp/endpoint'
   autoload :RouteHelpers, 'standard_mcp/route_helpers'
 
   module Schema
     autoload :Attributes, 'standard_mcp/schema/attributes'
+    autoload :Document, 'standard_mcp/schema/document'
     autoload :Input, 'standard_mcp/schema/input'
     autoload :Output, 'standard_mcp/schema/output'
     autoload :Where, 'standard_mcp/schema/where'

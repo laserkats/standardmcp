@@ -46,4 +46,41 @@ class ConfigurationTest < ActiveSupport::TestCase
     assert_equal false, StandardMCP.config.output_schema
   end
 
+  test "the resource settings default to both resources, describe and standardmcp" do
+    assert_equal %i[schema records], StandardMCP.config.resources
+    assert_equal true, StandardMCP.config.describe_tool
+    assert_equal 'standardmcp', StandardMCP.config.resource_scheme
+  end
+
+  test "resources accepts symbols and strings, and an empty list" do
+    StandardMCP.config.resources = ['records']
+    assert_equal %i[records], StandardMCP.config.resources
+
+    StandardMCP.config.resources = %i[schema schema]
+    assert_equal %i[schema], StandardMCP.config.resources
+
+    StandardMCP.config.resources = []
+    assert_equal [], StandardMCP.config.resources
+
+    StandardMCP.config.resources = nil
+    assert_equal [], StandardMCP.config.resources
+  end
+
+  test "resources rejects what it doesn't serve" do
+    error = assert_raises(ArgumentError) { StandardMCP.config.resources = %i[schema logs] }
+
+    assert_includes error.message, 'got :logs'
+    assert_equal %i[schema records], StandardMCP.config.resources
+  end
+
+  test "resource_scheme takes RFC 3986 scheme characters only" do
+    StandardMCP.config.resource_scheme = 'my-app+v2.1'
+    assert_equal 'my-app+v2.1', StandardMCP.config.resource_scheme
+
+    ['', '1app', 'my app', 'app:', 'app://', 'ap_p', nil, :app].each do |value|
+      assert_raises(ArgumentError, value.inspect) { StandardMCP.config.resource_scheme = value }
+    end
+    assert_equal 'my-app+v2.1', StandardMCP.config.resource_scheme
+  end
+
 end

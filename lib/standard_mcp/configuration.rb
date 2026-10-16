@@ -74,6 +74,24 @@ module StandardMCP
     # that production doesn't need. nil (the default) means that rule.
     attr_writer :validate_results
 
+    # Which resource templates the endpoint serves (StandardMCP::Resources):
+    # `schema` is `standardmcp://schema/{resource}`, the full column and
+    # association detail of a controller; `records` is
+    # `standardmcp://<resource>/{id}` per controller that allows show, so a
+    # client can attach a record as context. An Array of Symbols or Strings;
+    # [] serves none (and the endpoint doesn't advertise `resources`).
+    attr_reader :resources
+
+    RESOURCE_KINDS = %i[schema records].freeze
+
+    # Whether the `describe` tool is listed. It returns the same document as
+    # the `schema` resource, for clients that can't read resources.
+    attr_accessor :describe_tool
+
+    # URI scheme of the resource templates. RFC 3986: a letter, then letters,
+    # digits, `+`, `-` or `.`.
+    attr_reader :resource_scheme
+
     # Callable `->(exception, server_context) { ... }` the endpoint's MCP server
     # reports unexpected errors to (an error tracker, say). nil keeps the mcp
     # gem's default (its own, global, reporter).
@@ -102,6 +120,27 @@ module StandardMCP
       @validate_results = nil
       @exception_reporter = nil
       @allowed_origins = nil
+      @resources = RESOURCE_KINDS
+      @describe_tool = true
+      @resource_scheme = 'standardmcp'
+    end
+
+    def resources=(value)
+      kinds = Array(value).map { |kind| kind.respond_to?(:to_sym) ? kind.to_sym : kind }.uniq
+      unknown = kinds - RESOURCE_KINDS
+      if unknown.any?
+        raise ArgumentError, "resources must be a list of #{RESOURCE_KINDS.join(', ')}, got #{unknown.map(&:inspect).join(', ')}"
+      end
+
+      @resources = kinds.freeze
+    end
+
+    def resource_scheme=(value)
+      unless value.is_a?(String) && value.match?(/\A[A-Za-z][A-Za-z0-9+.-]*\z/)
+        raise ArgumentError, "resource_scheme must be an RFC 3986 URI scheme (letters, digits, +, - and .), got #{value.inspect}"
+      end
+
+      @resource_scheme = value
     end
 
     def validate_results

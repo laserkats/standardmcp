@@ -146,6 +146,8 @@ class SchemaWhereTest < ActiveSupport::TestCase
   end
 
   test "no association section without associations" do
+    # An anonymous class has no controller path to point describe at.
+    StandardMCP.config.describe_tool = false
     klass = Class.new(ApplicationController) do
       def self.model = Account
       def account_includes = []

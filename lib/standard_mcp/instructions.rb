@@ -93,6 +93,15 @@ module StandardMCP
         "Resources:\n#{lines.join("\n")}"
       end
 
+      # The resource names of the `describe` tool are the listed ones with `/`
+      # written as `_` (the segment the tool names use).
+      def describe_sentence(resources)
+        sentence = %(describe {"resource": "#{resources.first.name.tr('/', '_')}"} returns a resource's ) +
+          'columns, types, enums, operators and associations'
+        sentence += ' (write a "/" in its name as "_")' if resources.any? { |resource| resource.name.include?('/') }
+        "#{sentence}."
+      end
+
       # Only what holds for every tool and isn't said in each of them.
       def conventions(resources)
         actions = resources.flat_map(&:actions)
@@ -103,6 +112,7 @@ module StandardMCP
             "a tool's where description lists its columns and operators."
         end
         sentences << 'include embeds associations in the result.' if (actions & %i[index show create update]).any?
+        sentences << describe_sentence(resources) if StandardMCP.config.describe_tool
 
         writer = resources.find { |resource| (resource.actions & %i[create update]).any? }
         if writer

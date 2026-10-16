@@ -34,6 +34,13 @@ module StandardMCP
 
       NUMBERS = %i[integer bigint float decimal].freeze
 
+      INTRO = 'Filter records; all keys must match. Every key is a column or an association name, and every column ' \
+        'takes an operator object, e.g. {"size": {"gte": 1000}}, {"kind": {"in": ["office", "retail"]}}, ' \
+        '{"name": {"eq": null}} for is null, {"name": {"not": null}} for is not null.'.freeze
+
+      COMBINE = 'To combine filters, pass an array alternating filters with "AND" or "OR", e.g. [{...}, "OR", {...}]; ' \
+        'it is evaluated left to right with no precedence.'.freeze
+
       # Past this many characters a rejected value is cut in the message.
       VALUE_LENGTH = 60
 
@@ -73,26 +80,36 @@ module StandardMCP
           column.array ? "#{column.type}[]" : column.type.to_s
         end
 
+        # The rules a filter follows, without the lists of columns and
+        # associations: the operator object, the operators of the column types
+        # this controller's model has, and AND/OR. What the resource schema
+        # (Schema::Document) says once for a controller.
+        def rules(controller, model, tree)
+          columns = visible_columns(controller, model)
+          example = association_example(controller, model, tree)
+          nesting = "To filter on an association's columns, nest them under its name, e.g. #{example}." if example
+
+          [INTRO, operators(model, columns), nesting, COMBINE].compact.join("\n")
+        end
+
+        def visible_columns(controller, model)
+          hidden = Input.hidden(controller, model)
+          model.columns.reject { |column| hidden.include?(column.name) }
+        end
+
         private
 
         def description(controller, model, tree)
           columns = visible_columns(controller, model)
 
           [
-            'Filter records; all keys must match. Every key is a column or an association name, and every column ' \
-              'takes an operator object, e.g. {"size": {"gte": 1000}}, {"kind": {"in": ["office", "retail"]}}, ' \
-              '{"name": {"eq": null}} for is null, {"name": {"not": null}} for is not null.',
+            INTRO,
             operators(model, columns),
             "Columns:\n#{columns.map { |column| column_line(model, column) }.join("\n")}",
             associations(controller, model, tree),
-            'To combine filters, pass an array alternating filters with "AND" or "OR", e.g. [{...}, "OR", {...}]; ' \
-              'it is evaluated left to right with no precedence.'
+            COMBINE,
+            Description.describe_pointer(controller)
           ].compact.join("\n")
-        end
-
-        def visible_columns(controller, model)
-          hidden = Input.hidden(controller, model)
-          model.columns.reject { |column| hidden.include?(column.name) }
         end
 
         # :enum for a column restricted to a list of values, else the kind

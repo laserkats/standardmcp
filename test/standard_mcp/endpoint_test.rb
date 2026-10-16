@@ -147,7 +147,7 @@ class EndpointTest < ActionDispatch::IntegrationTest
   # --- tools/list
 
   test "tools/list lists the allowed tools" do
-    assert_equal %w[calculate_accounts get_account get_property list_accounts list_properties],
+    assert_equal %w[calculate_accounts describe get_account get_property list_accounts list_properties],
       tool_names.sort
   end
 
@@ -155,6 +155,179 @@ class EndpointTest < ActionDispatch::IntegrationTest
     refute(tool_names.any? { |n| n.include?('staff') })
     assert_equal %w[get_staff_account list_staff_accounts],
       tool_names(headers: { 'X-MCP-Staff' => 'true' }).grep(/staff/).sort
+  end
+
+  # --- resources
+
+  INITIALIZE_PARAMS = { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } }.freeze
+  WRITES = { 'X-MCP-Writes' => 'true' }.freeze
+
+  def template_uris(headers: {}, path: '/mcp')
+    rpc('resources/templates/list', headers: headers, path: path)
+    assert_response :success
+    result['resourceTemplates'].map { |t| t['uriTemplate'] }
+  end
+
+  # The one content of resources/read, its text parsed.
+  def read_resource(uri, headers: {}, path: '/mcp')
+    rpc('resources/read', { uri: uri }, headers: headers, path: path)
+    assert_response :success
+    assert_nil error, "JSON-RPC error: #{error}"
+    contents = result['contents']
+    assert_equal 1, contents.size
+    assert_equal uri, contents.first['uri']
+    assert_equal 'application/json', contents.first['mimeType']
+    JSON.parse(contents.first['text'])
+  end
+
+  def assert_resource_not_found(uri, headers: {})
+    rpc('resources/read', { uri: uri }, headers: headers)
+
+    assert_equal(-32602, error['code'])
+    assert_equal "Resource not found: #{uri}", error['message']
+    assert_equal({ 'uri' => uri }, error['data'])
+  end
+
+  test "initialize advertises resources" do
+    rpc('initialize', INITIALIZE_PARAMS)
+
+    assert result['capabilities'].key?('resources')
+  end
+
+  test "initialize doesn't advertise resources when none are configured" do
+    StandardMCP.config.resources = []
+    rpc('initialize', INITIALIZE_PARAMS)
+
+    assert result['capabilities'].key?('tools')
+    refute result['capabilities'].key?('resources')
+  end
+
+  test "resources/templates/list lists the templates of the caller" do
+    uris = template_uris
+
+    assert_equal %w[standardmcp://accounts/{id} standardmcp://properties/{id} standardmcp://schema/{resource}], uris.sort
+    assert_includes template_uris(headers: { 'X-MCP-Staff' => 'true' }), 'standardmcp://staff_accounts/{id}'
+    refute_includes uris, 'standardmcp://staff_accounts/{id}'
+  end
+
+  test "resources/templates/list says what each template is" do
+    rpc('resources/templates/list')
+    record = result['resourceTemplates'].find { |t| t['uriTemplate'] == 'standardmcp://accounts/{id}' }
+
+    assert_equal 'account', record['name']
+    assert_equal 'Account', record['title']
+    assert_equal 'application/json', record['mimeType']
+    assert_includes record['description'], 'A customer organization that owns properties.'
+  end
+
+  test "resources/templates/list is empty when the templates are switched off" do
+    StandardMCP.config.resources = []
+    rpc('resources/templates/list')
+
+    # The capability isn't advertised, so the gem refuses the method.
+    assert_nil result
+    assert error
+  end
+
+  test "resources/list has no concrete resources" do
+    rpc('resources/list')
+
+    assert_equal [], result['resources']
+  end
+
+  test "resources/read returns the schema document of a controller" do
+    doc = read_resource('standardmcp://schema/properties')
+
+    assert_equal 'properties', doc['resource']
+    assert_equal 'Rentable area in square feet.', doc['columns'].find { |c| c['name'] == 'size' }['description']
+    assert_equal %w[list_properties get_property], doc['tools']
+    refute(doc['columns'].any? { |c| c['writable'] })
+    assert(read_resource('standardmcp://schema/properties', headers: WRITES)['columns'].any? { |c| c['writable'] })
+  end
+
+  test "the schema document is the one describe returns" do
+    described = call_tool('describe', { resource: 'accounts' })['structuredContent']
+
+    assert_equal described, read_resource('standardmcp://schema/accounts')
+  end
+
+  test "resources/read returns a record with mask_for applied through the bearer" do
+    mine = create(:account, name: 'Mine')
+    other = create(:account)
+
+    assert_equal 'Mine', read_resource("standardmcp://accounts/#{mine.id}", headers: bearer(mine.id))['name']
+    assert_resource_not_found "standardmcp://accounts/#{other.id}", headers: bearer(mine.id)
+    assert_equal other.id, read_resource("standardmcp://accounts/#{other.id}")['id']
+  end
+
+  test "resources/read is not found for anything the caller can't see, with one error" do
+    account = create(:account)
+
+    assert_resource_not_found 'standardmcp://schema/contacts'
+    assert_resource_not_found 'standardmcp://schema/staff_accounts'
+    assert_resource_not_found "standardmcp://staff_accounts/#{account.id}"
+    assert_resource_not_found 'standardmcp://accounts/0'
+    assert_resource_not_found 'standardmcp://nothing/1'
+    assert_resource_not_found 'file:///etc/passwd'
+
+    # Visible once the caller is allowed.
+    assert read_resource('standardmcp://schema/contacts', headers: WRITES)
+    assert_equal account.id, read_resource("standardmcp://staff_accounts/#{account.id}", headers: { 'X-MCP-Staff' => 'true' })['id']
+  end
+
+  test "resources/read without a uri is not found" do
+    rpc('resources/read', {})
+
+    assert_equal(-32602, error['code'])
+  end
+
+  test "resources/read builds only the template its URI matches" do
+    ready = StandardMCP::Resources.for(request_for_mcp, only_uri: 'standardmcp://accounts/1').first
+    StandardMCP::Resources.expects(:schema_template).never
+    StandardMCP::Resources.expects(:record_template).once.returns(ready)
+
+    rpc('resources/read', { uri: 'standardmcp://accounts/1' })
+
+    assert_response :success
+  end
+
+  test "resources/read of a schema builds no record templates" do
+    StandardMCP::Resources.expects(:record_template).never
+
+    assert_equal 'accounts', read_resource('standardmcp://schema/accounts')['resource']
+  end
+
+  test "resources/templates/list builds every template and renders no schema" do
+    StandardMCP::Schema::Document.expects(:for).never
+
+    assert_equal 3, template_uris.size
+  end
+
+  test "other requests build no templates" do
+    StandardMCP::Resources.expects(:for).never
+
+    rpc('initialize', INITIALIZE_PARAMS)
+    rpc('tools/list')
+    rpc('tools/call', { name: 'list_accounts', arguments: {} })
+    rpc('server/discover')
+    assert_response :success
+  end
+
+  test "an app's own controller serves the resources too" do
+    account = create(:account)
+
+    assert_includes template_uris(path: '/custom_mcp'), 'standardmcp://schema/{resource}'
+    rpc('resources/read', { uri: "standardmcp://accounts/#{account.id}" }, path: '/custom_mcp')
+    assert_equal account.id, JSON.parse(result['contents'].first['text'])['id']
+  end
+
+  test "resources/read stays in the configured scheme" do
+    StandardMCP.config.resource_scheme = 'app'
+    account = create(:account)
+
+    assert_includes template_uris, 'app://schema/{resource}'
+    assert_equal account.id, read_resource("app://accounts/#{account.id}")['id']
+    assert_resource_not_found "standardmcp://accounts/#{account.id}"
   end
 
   # --- tools/call
@@ -485,7 +658,7 @@ class EndpointTest < ActionDispatch::IntegrationTest
     mine = create(:account)
     create(:account)
 
-    assert_equal %w[calculate_accounts get_account get_property list_accounts list_properties],
+    assert_equal %w[calculate_accounts describe get_account get_property list_accounts list_properties],
       tool_names(path: '/custom_mcp').sort
     assert_equal [mine.id],
       call_tool('list_accounts', headers: bearer(mine.id), path: '/custom_mcp')['structuredContent']['records'].map { |r| r['id'] }

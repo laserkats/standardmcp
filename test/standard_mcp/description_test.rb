@@ -88,7 +88,8 @@ class DescriptionTest < ActiveSupport::TestCase
 
   test "create: names the required attributes" do
     assert_equal 'Create one property. A real estate asset owned by an account. Required: name. ' \
-      "#{StandardMCP::Description::IGNORED} Includes: account, photos.", describe(PropertiesController, :create)
+      "#{StandardMCP::Description::IGNORED} Includes: account, photos. " \
+      'Full column details: describe {"resource": "properties"}.', describe(PropertiesController, :create)
     assert_includes describe(ContactsController, :create), 'Required: name.'
   end
 
@@ -98,8 +99,17 @@ class DescriptionTest < ActiveSupport::TestCase
 
   test "update: send only what changes" do
     assert_equal 'Update one property by id. A real estate asset owned by an account. ' \
-      "Send only the attributes to change. #{StandardMCP::Description::IGNORED} Includes: account, photos.",
+      "Send only the attributes to change. #{StandardMCP::Description::IGNORED} Includes: account, photos. " \
+      'Full column details: describe {"resource": "properties"}.',
       describe(PropertiesController, :update)
+  end
+
+  test "the describe pointer is only there with the describe tool" do
+    StandardMCP.config.describe_tool = false
+
+    refute_includes describe(PropertiesController, :create), 'describe'
+    refute_includes describe(PropertiesController, :update), 'describe'
+    refute_includes describe(PropertiesController, :show), 'describe'
   end
 
   test "destroy: delete is permanent" do

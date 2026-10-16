@@ -1,8 +1,8 @@
 require 'json'
 
 module StandardMCP
-  # What a client would be sent, without a client: the server instructions and
-  # `tools/list` for a synthetic request that carries only the headers given.
+  # What a client would be sent, without a client: the server instructions,
+  # `tools/list` and the resource templates for a synthetic request that carries only the headers given.
   # Per-request ACLs and `allow_mcp` conditions see those headers and nothing
   # else (no session, no cookies unless one is passed), so a tool hidden behind
   # `current_user` shows up once an Authorization header resolves one.
@@ -10,20 +10,25 @@ module StandardMCP
     FORMATS = %w[json summary].freeze
 
     class << self
-      # Prints to +io+ and returns { instructions:, tools: } (tools as the
-      # Hashes `tools/list` carries).
+      # Prints to +io+ and returns { instructions:, tools:, resource_templates: }
+      # (tools and templates as the Hashes `tools/list` and
+      # `resources/templates/list` carry).
       #
       # +headers+ is a Hash, or the text of `Name: value` pairs separated by
       # `;` or newlines (see parse_headers). +format+ is 'json' (the default) or
       # 'summary'. +tool+ is a tool name: only that tool is shown, and an
-      # unknown one raises ArgumentError.
-      def call(headers: {}, format: 'json', tool: nil, io: $stdout)
+      # unknown one raises ArgumentError. +uri+ is a resource URI: only what
+      # reading it returns is printed (ArgumentError when it can't be read).
+      def call(headers: {}, format: 'json', tool: nil, uri: nil, io: $stdout)
         format = (format.presence || 'json').to_s
         raise ArgumentError, "format must be one of #{FORMATS.join(', ')}, got #{format.inspect}" unless FORMATS.include?(format)
 
         headers = parse_headers(headers) unless headers.is_a?(Hash)
         request = request_for(headers)
+        return read(request, uri.to_s, io) if uri.present?
+
         tools = Tools.for(request).map(&:to_h)
+        templates = Resources.for(request).map(&:to_h)
         instructions = Instructions.for(request)
 
         if tool.present?
@@ -33,12 +38,12 @@ module StandardMCP
         end
 
         if format == 'json'
-          io.puts JSON.pretty_generate(tool.present? ? tools.first : { instructions: instructions, tools: tools })
+          io.puts JSON.pretty_generate(tool.present? ? tools.first : { instructions: instructions, tools: tools, resourceTemplates: templates })
         else
-          summary(io, instructions, tools, tool.present?)
+          summary(io, instructions, tools, templates, tool.present?)
         end
 
-        { instructions: instructions, tools: tools }
+        { instructions: instructions, tools: tools, resource_templates: templates }
       end
 
       # { 'Authorization' => 'Bearer 1' } from "Authorization: Bearer 1; X-A: b".
@@ -65,9 +70,30 @@ module StandardMCP
         ActionDispatch::Request.new(Rack::MockRequest.env_for('/mcp', env))
       end
 
+      # What `resources/read` would answer for +uri+, printed (the JSON of a
+      # record or schema pretty-printed). The templates are the ones a read
+      # builds, so a URI the caller can't read is "Resource not found".
+      def read(request, uri, io)
+        params = nil
+        template = Resources.for(request, only_uri: uri).find { |candidate| params = candidate.match_uri(uri) }
+        contents = template.contents(**params)
+
+        text = begin
+          JSON.pretty_generate(JSON.parse(contents.text))
+        rescue JSON::ParserError
+          contents.text
+        end
+        io.puts text
+
+        { contents: contents.to_h }
+      rescue MCP::Server::RequestHandlerError => e
+        raise ArgumentError, e.message
+      end
+
       # name, size of the tool as sent (compact JSON characters) and the first
-      # sentence of its description; then the totals.
-      def summary(io, instructions, tools, single)
+      # sentence of its description; then the totals, and the resource
+      # templates.
+      def summary(io, instructions, tools, templates, single)
         width = tools.map { |entry| entry[:name].length }.max.to_i
         sizes = tools.map { |entry| JSON.generate(entry).length }
 
@@ -78,6 +104,10 @@ module StandardMCP
         io.puts
         io.puts "#{tools.size} tool#{'s' unless tools.size == 1}, #{sizes.sum} characters" \
           "#{" (instructions: #{instructions.to_s.length} characters)" unless single}"
+        return if single || templates.empty?
+
+        io.puts "#{templates.size} resource template#{'s' unless templates.size == 1}, " \
+          "#{JSON.generate(templates).length} characters: #{templates.map { |entry| entry[:uriTemplate] }.join(', ')}"
       end
 
       def first_sentence(text)

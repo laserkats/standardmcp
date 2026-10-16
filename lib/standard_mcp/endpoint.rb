@@ -4,7 +4,8 @@ require 'active_support/concern'
 module StandardMCP
   # The MCP transport as a controller action: `handle` answers the JSON-RPC
   # messages POSTed to it (the MCP "Streamable HTTP" transport) with the tools
-  # from `StandardMCP::Tools.for(request)`. Include it in a controller and route
+  # from `StandardMCP::Tools.for(request)` and the resource templates from
+  # `StandardMCP::Resources.for(request)`. Include it in a controller and route
   # to `handle` (`standard_mcp '/mcp', to: 'mcp#handle'`), or use the default
   # `StandardMCP::ServerController`, which does exactly that.
   #
@@ -78,8 +79,12 @@ module StandardMCP
         version: StandardMCP.config.server_version,
         instructions: mcp_instructions,
         tools: mcp_tools,
+        resource_templates: mcp_resource_templates,
         configuration: mcp_configuration
-      )
+      ).tap do |server|
+        # Nothing to read or list, so don't claim to serve resources.
+        server.capabilities = server.capabilities.except(:resources) if StandardMCP.config.resources.empty?
+      end
     end
 
     # `validate_tool_call_arguments` stays on: the input schemas are what keep
@@ -103,6 +108,24 @@ module StandardMCP
       StandardMCP::Tools.for(request, only: mcp_called_tool_name)
     end
 
+    # Only the methods that use the templates build them: a read needs the one
+    # its URI matches (and answers "Resource not found" for any other), the
+    # listing needs them all (cheaply, nothing is rendered until a read), and
+    # everything else, tools/list and initialize included, none.
+    def mcp_resource_templates
+      return [] unless request.post? && request.media_type == 'application/json'
+
+      case mcp_method_name
+      when MCP::Methods::RESOURCES_READ
+        # A request without a usable URI finds nothing, like any unknown one.
+        StandardMCP::Resources.for(request, only_uri: mcp_params['uri'].to_s)
+      when MCP::Methods::RESOURCES_TEMPLATES_LIST
+        StandardMCP::Resources.for(request)
+      else
+        []
+      end
+    end
+
     def mcp_called_tool_name
       message = mcp_message
       return unless message.is_a?(Hash) && message['method'] == 'tools/call'
@@ -115,6 +138,12 @@ module StandardMCP
     def mcp_method_name
       message = mcp_message
       message['method'] if message.is_a?(Hash)
+    end
+
+    def mcp_params
+      message = mcp_message
+      params = message['params'] if message.is_a?(Hash)
+      params.is_a?(Hash) ? params : {}
     end
 
     # The JSON-RPC message, or nil when the body isn't JSON (the transport

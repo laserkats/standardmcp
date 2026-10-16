@@ -109,6 +109,66 @@ column comments as descriptions, and the tool rejects anything else.
   `"Contact could not be deleted: Locked contacts cannot be deleted"` (just
   `"Contact could not be deleted"` when it added none).
 
+## Schema and records on demand
+
+`tools/list` stays small because the tool schemas are shallow. The detail is
+one call or read away, and records can be attached as context.
+
+### `describe` and `standardmcp://schema/{resource}`
+
+`describe` takes `{"resource": "properties"}` and returns, as structured
+content (and as text), what the shallow schemas leave out: for every column its
+type, `nullable`, comment, `enum` and whether it is
+`orderable` or `writable`, for every association its `kind`, the `resource` that
+serves it, whether it can be included, filtered on or written through (`nested`),
+and the `where` rules (operators per type, AND/OR). A flag is present only when
+true and an empty value is left out. The resource is the controller path with
+`/` written as `_` (`admin_accounts`), the segment the tool names use; the
+`enum` of its argument lists the caller's own.
+
+The same document is the resource template `standardmcp://schema/{resource}`,
+for clients that can read resources. Both are built for the caller: a controller
+is readable when the caller is allowed any MCP action on it, columns and
+associations an ACL `excludes` are absent, `tools` lists the caller's tools, and
+`writable` needs create or update. Anything else is "not found", the same
+answer as for a resource that doesn't exist.
+
+The shallow `where` and the create/update descriptions end with a pointer
+(`Full column details: describe {"resource": "accounts"}.`), and the
+instructions have a line about `describe`: about 60 characters per description
+and 106 in the instructions for the sample app, plus the tool itself (about 490).
+
+### Records: `standardmcp://<resource>/{id}`
+
+For every controller that allows `show` to the caller there is a template such
+as `standardmcp://accounts/{id}` (`standardmcp://admin_accounts/{id}`): reading
+it returns the record as `application/json`, so a client can attach it as
+context. The read is a dispatched `show`, so `allow_mcp`, the ACL, excludes and
+`mask_for` apply exactly as for `get_account`. A record that is masked,
+missing, forbidden or on a controller the caller can't use is the same error as
+an unknown URI (`Resource not found: <uri>`, JSON-RPC -32602 with the URI in
+`data`: the `mcp` gem follows SEP-2164, not the older -32002), so neither the
+mask nor a hidden controller shows. Other client errors come back as -32602
+with their message, a server error as an internal error.
+
+- No `include`: the `mcp` gem only matches plain `{var}` expressions in a
+  template, not RFC 6570 query ones such as `{?include}`. A `{var}` matches one
+  path segment (no `/`) and is not percent-decoded.
+- `schema/{resource}` and `<resource>/{id}` share a shape, so a controller
+  whose resource name is `schema` that allows `show` raises when the templates
+  are built (like duplicate tool names do). Rename it, or serve only one of them
+  with `config.resources`.
+- The endpoint only has templates: `resources/list` is empty, and templates are
+  listed by `resources/templates/list`. It is stateless, so there are no
+  subscriptions or list-changed notifications. Whether and how a client lists
+  templates, lets a user attach a resource or lets the model read one is up to
+  the client, which is why `describe` is a tool too.
+
+`config.resources = []` serves no templates (and `resources` isn't advertised
+in `initialize`); `config.describe_tool = false` drops the tool and the
+pointers. `rake standard_mcp:tools URI=standardmcp://schema/accounts` prints what
+reading a URI returns.
+
 ## Context from comments
 
 The gem takes the application's context from database comments (Postgres), so
@@ -152,7 +212,7 @@ Resources:
 accounts: A customer organization that owns properties. Tools: list_accounts, get_account, calculate_accounts.
 properties: A real estate asset owned by an account. Tools: list_properties, get_property.
 
-Conventions: list_* tools return one page; pass the result's next_offset as offset to get the next. Filters (where) take operator objects such as {"size": {"gte": 1000}}; a tool's where description lists its columns and operators. include embeds associations in the result.
+Conventions: list_* tools return one page; pass the result's next_offset as offset to get the next. Filters (where) take operator objects such as {"size": {"gte": 1000}}; a tool's where description lists its columns and operators. include embeds associations in the result. describe {"resource": "accounts"} returns a resource's columns, types, enums, operators and associations.
 ```
 
 A model without a table comment is still listed, with its tools. The operators
@@ -215,28 +275,34 @@ expose more to some callers than is checked here.
 
 ### `rake standard_mcp:tools`
 
-Prints the server instructions and `tools/list` a caller would get, without a
-client:
+Prints the server instructions, `tools/list` and resource templates a caller
+would get, without a client:
 
 ```
 $ HEADERS='X-MCP-Writes: true' FORMAT=summary bundle exec rake standard_mcp:tools
-list_accounts           3075  List accounts.
+list_accounts           3136  List accounts.
 get_account              905  Get one account by id.
-create_contact          1378  Create one contact.
+create_contact          1438  Create one contact.
 ...
-11 tools, 24258 characters (instructions: 868 characters)
+describe                 494  Describe a resource: its columns with types, enums and filter operators, and its associations.
+
+12 tools, 25244 characters (instructions: 974 characters)
+3 resource templates, 719 characters: standardmcp://schema/{resource}, standardmcp://accounts/{id}, standardmcp://properties/{id}
 ```
 
 - `HEADERS`: `Name: value` pairs separated by `;` or newlines (a value that
   contains `;` goes on a line of its own).
-- `FORMAT`: `json` (the default: `{"instructions": ..., "tools": [...]}`) or
-  `summary` (a line per tool with its size in compact-JSON characters and the
-  first sentence of its description, then the total).
+- `FORMAT`: `json` (the default: `{"instructions": ..., "tools": [...],
+  "resourceTemplates": [...]}`) or `summary` (a line per tool with its size in
+  compact-JSON characters and the first sentence of its description, then the
+  total and a line for the resource templates).
 - `TOOL=list_accounts`: only that tool (its full definition for `json`).
+- `URI=standardmcp://schema/accounts`: only what reading that URI returns
+  (pretty-printed), or the "Resource not found" it would answer with.
 
 Per-request ACLs and `allow_mcp` conditions are evaluated with the given
 headers only: there is no session, and no cookies unless you pass a `Cookie`
-header. The call is `StandardMCP::Preview.call(headers:, format:, tool:, io:)`.
+header. The call is `StandardMCP::Preview.call(headers:, format:, tool:, uri:, io:)`.
 
 ## Mounting the endpoint
 
@@ -313,6 +379,9 @@ StandardMCP.configure do |config|
   config.output_schema = false
   config.validate_results = nil              # default: on outside production
   config.allowed_origins = nil               # e.g. ['https://claude.ai', /\Ahttps:\/\/.*\.example\.com\z/]
+  config.resources = %i[schema records]      # resource templates served; [] for none
+  config.describe_tool = true                # the describe tool and the pointers to it
+  config.resource_scheme = 'standardmcp'     # scheme of the resource URIs
   config.exception_reporter = ->(exception, server_context) { Rails.error.report(exception) }
 end
 ```
@@ -336,6 +405,14 @@ end
 - `instructions`: nil generates them from the comments; a String or a callable
   taking the request replaces that, a callable taking the request and the
   generated text adds to it, false sends none.
+- `resources`: the resource templates served, an Array of Symbols or Strings:
+  `schema` (`standardmcp://schema/{resource}`) and `records`
+  (`standardmcp://<resource>/{id}` per controller allowing show); `[]` serves
+  none and `initialize` stops advertising `resources`.
+- `describe_tool`: lists the `describe` tool, and the pointers to it in the
+  shallow `where` and create/update descriptions and in the instructions.
+- `resource_scheme`: the URI scheme of the templates; letters, digits, `+`, `-`
+  and `.` (RFC 3986), starting with a letter.
 - `lint_ignore_columns`: columns `standard_mcp:lint` doesn't expect a comment on.
 - `exception_reporter`: called with unexpected errors; nil keeps the mcp gem's.
 

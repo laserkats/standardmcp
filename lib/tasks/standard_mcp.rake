@@ -16,10 +16,11 @@ namespace :standard_mcp do
     end
   end
 
-  desc 'Print the server instructions and tools/list a caller would get ' \
-    "(HEADERS='Authorization: Bearer 1; X-A: b', FORMAT=json|summary, TOOL=list_accounts)"
+  desc 'Print the server instructions, tools/list and resource templates a caller would get ' \
+    "(HEADERS='Authorization: Bearer 1; X-A: b', FORMAT=json|summary, TOOL=list_accounts, " \
+    'URI=standardmcp://schema/accounts to print what reading it returns)'
   task tools: :environment do
-    StandardMCP::Preview.call(headers: ENV['HEADERS'].to_s, format: ENV['FORMAT'], tool: ENV['TOOL'])
+    StandardMCP::Preview.call(headers: ENV['HEADERS'].to_s, format: ENV['FORMAT'], tool: ENV['TOOL'], uri: ENV['URI'])
   rescue ArgumentError => e
     abort "standard_mcp:tools: #{e.message}"
   end

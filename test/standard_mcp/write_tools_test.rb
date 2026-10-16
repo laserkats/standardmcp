@@ -104,8 +104,8 @@ class WriteToolsTest < ActiveSupport::TestCase
     StandardMCP::Registry.stubs(:controllers).returns([Billing::AccountsController])
     tools = StandardMCP::Tools.for(request_for)
 
-    assert_equal %w[create_billing_account delete_billing_account update_billing_account], tools.map(&:name_value).sort
-    assert_equal ['Create billing account', 'Delete billing account', 'Update billing account'],
+    assert_equal %w[create_billing_account delete_billing_account describe update_billing_account], tools.map(&:name_value).sort
+    assert_equal ['Create billing account', 'Delete billing account', 'Describe a resource', 'Update billing account'],
       tools.map { |t| t.title }.sort
   end
 

@@ -342,6 +342,9 @@ module StandardMCP
             { 'description' => description }.merge(Input.nullable(object))
           end
         end
+
+        # Shared with Schema::Document, which flags the writable columns.
+        public :writable?
       end
     end
   end

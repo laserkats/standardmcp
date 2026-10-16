@@ -82,7 +82,7 @@ class InstructionsTest < ActiveSupport::TestCase
 
   test "the tool names are the ones Tools builds" do
     request = request_for(WRITES.merge('X-MCP-Staff' => 'true'))
-    advertised = StandardMCP::Tools.for(request).map(&:name_value)
+    advertised = StandardMCP::Tools.for(request).map(&:name_value) - ['describe']
     named = StandardMCP::Instructions.for(request).scan(/\b(?:list|get|create|update|delete|calculate)_[a-z_]+/).uniq
       .reject { |name| name.end_with?('_*') }
 
@@ -100,6 +100,33 @@ class InstructionsTest < ActiveSupport::TestCase
     writes = instructions(WRITES)
     assert_includes writes, 'create_* and update_* take the record under its singular name, e.g. {"contact": {...}}.'
     assert_includes writes, "update_* and delete_* take the record's id."
+  end
+
+  test "the conventions say what describe returns, with a resource of the caller" do
+    text = instructions
+
+    assert_includes text, %(describe {"resource": "accounts"} returns a resource's columns, types, enums, operators and associations.)
+    refute_includes text, '"/" in its name'
+  end
+
+  test "the describe line tells how a namespaced resource is written" do
+    namespaced = Class.new(ApplicationController) do
+      allow_mcp only: [:index]
+      def self.model = Account
+      def self.name = 'Billing::AccountsController'
+      def self.controller_path = 'billing/accounts'
+    end
+    StandardMCP::Registry.stubs(:controllers).returns([namespaced, AccountsController])
+
+    assert_includes instructions, 'billing/accounts: '
+    assert_includes instructions, 'describe {"resource": "billing_accounts"} returns'
+    assert_includes instructions, '(write a "/" in its name as "_")'
+  end
+
+  test "the describe line is there only when describe is" do
+    StandardMCP.config.describe_tool = false
+
+    refute_includes instructions, 'describe'
   end
 
   test "there is nothing to say without a database comment or an allowed resource" do

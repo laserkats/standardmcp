@@ -2,7 +2,8 @@ module StandardMCP
   # Builds the MCP tools for one request: one MCP::Tool per allowed
   # (controller, action), named from the controller path (index
   # `list_accounts`, show `get_account`, create `create_account`, update
-  # `update_account`, destroy `delete_account`, calculate `calculate_accounts`).
+  # `update_account`, destroy `delete_account`, calculate `calculate_accounts`),
+  # and a `describe` tool when the caller has any resource (see Resources).
   #
   # Tools are built per request because the ACL-derived schemas and `if:`
   # conditions depend on the caller. Each tool closes over that request and
@@ -30,6 +31,10 @@ module StandardMCP
 
     # Actions on one record, named for its singular (`get_account`).
     SINGULAR = %i[show create update destroy].freeze
+
+    # The tool that returns Resources' schema document, for clients that can't
+    # read resources. Listed when the caller has any resource.
+    DESCRIBE = 'describe'.freeze
 
     # MCP spec: 1-64 characters. (The mcp gem allows 128.)
     MAX_NAME_LENGTH = 64
@@ -61,7 +66,8 @@ module StandardMCP
       # needn't pay for every tool. The per-request `allow_mcp` conditions
       # still decide first, so a tool hidden from this caller is never built.
       def for(request, only: nil)
-        tools = Registry.allowed(request).flat_map do |klass, actions|
+        allowed = Registry.allowed(request)
+        tools = allowed.flat_map do |klass, actions|
           # StandardAPI infers the model from the controller's name.
           raise Error, "#{klass.name} allows MCP actions but has no model" unless klass.model
 
@@ -76,7 +82,8 @@ module StandardMCP
         duplicates = tools.group_by(&:name_value).select { |_, group| group.size > 1 }.keys
         raise Error, "Duplicate MCP tool names: #{duplicates.join(', ')}" if duplicates.any?
 
-        tools
+        tools << describe_tool(request, allowed) if (only.nil? || only == DESCRIBE) && StandardMCP.config.describe_tool
+        tools.compact
       end
 
       def tool_name(klass, action)
@@ -113,7 +120,36 @@ module StandardMCP
         Response.not_allowed(action)
       end
 
+      # Runs one describe call: the schema document of resource +name+.
+      def describe(request, entries, name)
+        document = Resources.document(request, entries, name.to_s)
+        return Response.error("Unknown resource #{name.to_s.inspect}") unless document
+
+        MCP::Tool::Response.new([{ type: 'text', text: JSON.generate(document) }], structured_content: document)
+      end
+
       private
+
+      # nil when the caller has no resource.
+      def describe_tool(request, allowed)
+        entries = Resources.entries(allowed)
+        return if entries.empty?
+
+        MCP::Tool.define(
+          name: DESCRIBE,
+          title: 'Describe a resource',
+          description: 'Describe a resource: its columns with types, enums and filter operators, and its associations.',
+          input_schema: {
+            type: 'object',
+            properties: { resource: { type: 'string', enum: entries.map(&:name) } },
+            required: ['resource'],
+            additionalProperties: false
+          },
+          annotations: READ_ONLY
+        ) do |server_context: nil, **args|
+          Tools.describe(request, entries, args[:resource])
+        end
+      end
 
       def build(request, klass, controller, action, countable)
         input = Schema::Input.for(controller, action)

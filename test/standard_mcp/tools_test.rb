@@ -95,7 +95,7 @@ class ToolsTest < ActiveSupport::TestCase
     names = list_tools.map { |t| t[:name] }
 
     assert_equal %w[
-      calculate_accounts get_account list_accounts
+      calculate_accounts describe get_account list_accounts
       get_property list_properties
     ].sort, names.sort
   end
@@ -539,7 +539,8 @@ class ToolsTest < ActiveSupport::TestCase
     StandardMCP.config.output_schema = true
     create(:property, account: create(:account))
 
-    assert(list_tools.all? { |t| t[:outputSchema] })
+    # describe returns a document of its own, not a record.
+    assert(list_tools.reject { |t| t[:name] == 'describe' }.all? { |t| t[:outputSchema] })
     assert_equal 1, structured('list_properties')[:records].size
   end
 
@@ -655,6 +656,107 @@ class ToolsTest < ActiveSupport::TestCase
 
   # --- size
 
+  # --- describe
+
+  WRITES = { 'X-MCP-Writes' => 'true' }.freeze
+
+  def describe_enum(headers = {})
+    tool('describe', headers).dig(:inputSchema, :properties, :resource, :enum).sort
+  end
+
+  test "describe takes a resource of the caller and is read-only" do
+    describe = tool('describe')
+
+    assert_equal 'Describe a resource', describe[:title]
+    assert_includes describe[:description], 'columns'
+    assert_includes describe[:description], 'enums'
+    assert_includes describe[:description], 'operators'
+    assert_includes describe[:description], 'associations'
+    assert_equal ['resource'], describe[:inputSchema][:required]
+    assert_equal false, describe[:inputSchema][:additionalProperties]
+    assert_equal 'string', describe[:inputSchema].dig(:properties, :resource, :type)
+    assert_equal({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      describe[:annotations])
+    refute describe.key?(:outputSchema)
+  end
+
+  test "the describe enum is the resources of the caller" do
+    assert_equal %w[accounts properties], describe_enum
+    assert_equal %w[accounts contacts properties], describe_enum(WRITES)
+    assert_equal %w[accounts admin_accounts properties], describe_enum('X-MCP-Admin' => 'true')
+  end
+
+  test "a resource of the caller is described as the schema resource describes it" do
+    result = call_tool('describe', { resource: 'properties' }, WRITES)
+    document = JSON.parse(JSON.generate(result[:structuredContent]))
+
+    refute result[:isError]
+    assert_equal document, JSON.parse(result[:content].first[:text])
+    assert_equal 'properties', document['resource']
+    assert_equal document, StandardMCP::Resources.document(
+      request_for(WRITES), StandardMCP::Resources.entries(StandardMCP::Registry.allowed(request_for(WRITES))), 'properties'
+    )
+    assert document['columns'].any? { |c| c['writable'] }
+  end
+
+  test "a namespaced resource is written with underscores" do
+    document = structured('describe', { resource: 'admin_accounts' }, 'X-MCP-Admin' => 'true')
+
+    assert_equal 'admin_accounts', document[:resource]
+    assert_equal %w[get_admin_account list_admin_accounts], document[:tools].sort
+  end
+
+  test "a hidden resource is not in the enum and can't be described" do
+    refute_includes describe_enum, 'contacts'
+    refute_includes describe_enum, 'admin_accounts'
+
+    assert_includes tool_error('describe', { resource: 'contacts' }), 'resource'
+    assert_includes tool_error('describe', { resource: 'admin_accounts' }), 'resource'
+    assert_includes tool_error('describe', { resource: 'photos' }), 'resource'
+  end
+
+  test "describe isn't listed without a resource or with the tool switched off" do
+    StandardMCP::Registry.stubs(:controllers).returns([PhotosController])
+    assert_empty list_tools
+
+    StandardMCP::Registry.stubs(:controllers).returns([AccountsController])
+    assert_includes list_tools.map { |t| t[:name] }, 'describe'
+
+    StandardMCP.config.describe_tool = false
+    refute_includes list_tools.map { |t| t[:name] }, 'describe'
+  end
+
+  test "only builds describe when asked for it" do
+    request = request_for
+
+    assert_equal %w[describe], StandardMCP::Tools.for(request, only: 'describe').map(&:name_value)
+    assert_equal %w[list_accounts], StandardMCP::Tools.for(request, only: 'list_accounts').map(&:name_value)
+    assert_empty StandardMCP::Tools.for(request, only: 'nothing')
+  end
+
+  test "the shallow descriptions point at describe, with the resource name" do
+    assert_includes tool('list_accounts')[:inputSchema].dig(:properties, :where, :description),
+      'Full column details: describe {"resource": "accounts"}.'
+    assert_includes tool('calculate_properties', WRITES)[:inputSchema].dig(:properties, :where, :description),
+      'describe {"resource": "properties"}'
+    assert_includes tool('list_admin_accounts', 'X-MCP-Admin' => 'true')[:inputSchema].dig(:properties, :where, :description),
+      'describe {"resource": "admin_accounts"}'
+    assert_includes tool('create_property', WRITES)[:description], 'Full column details: describe {"resource": "properties"}.'
+    assert_includes tool('update_property', WRITES)[:description], 'describe {"resource": "properties"}'
+  end
+
+  test "without describe nothing points at it" do
+    StandardMCP.config.describe_tool = false
+
+    refute_includes JSON.generate(list_tools(WRITES)), 'describe'
+  end
+
+  test "a deep where schema spells the columns out and has no pointer" do
+    StandardMCP.config.input_schema_depth = 'deep'
+
+    refute_includes JSON.generate(tool('list_accounts')[:inputSchema]), 'describe'
+  end
+
   # Measured with the two controllers below; the limits leave about 10% room.
   test "the shallow tools/list stays small" do
     StandardMCP.reset_config!
@@ -662,12 +764,13 @@ class ToolsTest < ActiveSupport::TestCase
     tools = list_tools
     sizes = tools.to_h { |t| [t[:name], JSON.generate(t).size] }
 
-    assert_equal 5, tools.size
+    assert_equal 6, tools.size
     assert_operator JSON.generate(tool('list_accounts')[:inputSchema]).size, :<=, 2_950
-    assert_operator sizes['list_accounts'], :<=, 3_400
-    assert_operator sizes['list_properties'], :<=, 4_500
-    assert_operator sizes['calculate_accounts'], :<=, 3_200
-    assert_operator JSON.generate(tools).size, :<=, 13_200
+    assert_operator sizes['list_accounts'], :<=, 3_450
+    assert_operator sizes['list_properties'], :<=, 4_550
+    assert_operator sizes['calculate_accounts'], :<=, 3_250
+    assert_operator sizes['describe'], :<=, 550
+    assert_operator JSON.generate(tools).size, :<=, 13_900
   end
 
 end

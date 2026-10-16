@@ -152,6 +152,26 @@ class ToolsTest < ActiveSupport::TestCase
     refute_includes names, 'calculate_admin_accounts'
   end
 
+  # --- only
+
+  test "only builds just the named tool" do
+    StandardMCP::Schema::Input.expects(:for).once.returns({ 'type' => 'object', 'properties' => {} })
+
+    tools = StandardMCP::Tools.for(request_for, only: 'get_property')
+
+    assert_equal %w[get_property], tools.map(&:name_value)
+  end
+
+  test "only names that don't exist build nothing" do
+    assert_empty StandardMCP::Tools.for(request_for, only: 'delete_everything')
+  end
+
+  test "only still applies the per-request conditions" do
+    assert_empty StandardMCP::Tools.for(request_for, only: 'list_admin_accounts')
+    assert_equal %w[list_admin_accounts],
+      StandardMCP::Tools.for(request_for('X-MCP-Admin' => 'true'), only: 'list_admin_accounts').map(&:name_value)
+  end
+
   test "tool names over the MCP limit are rejected" do
     PropertiesController.stubs(:controller_path).returns('p' * 60)
 

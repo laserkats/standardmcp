@@ -53,6 +53,25 @@ module StandardMCP
     # returned either way.
     attr_accessor :output_schema
 
+    # Whether the endpoint validates tool results against their output schema
+    # (only meaningful with `output_schema`). Defaults to on outside production:
+    # it catches schema drift in development and tests, and costs time per call
+    # that production doesn't need. nil (the default) means that rule.
+    attr_writer :validate_results
+
+    # Callable `->(exception, server_context) { ... }` the endpoint's MCP server
+    # reports unexpected errors to (an error tracker, say). nil keeps the mcp
+    # gem's default (its own, global, reporter).
+    attr_accessor :exception_reporter
+
+    # Origins (the `Origin` request header) the endpoint accepts besides its
+    # own. nil or empty accepts requests without an `Origin` (non-browser
+    # clients) and same-origin ones, which refuses a cross-site page driving the
+    # endpoint with the caller's cookies. An Array of Strings (exact,
+    # case-insensitive, e.g. 'https://claude.ai') and/or Regexps widens that.
+    # Anything else is answered with 403.
+    attr_accessor :allowed_origins
+
     def initialize
       @server_name = nil
       @server_version = nil
@@ -63,6 +82,13 @@ module StandardMCP
       @where_depth = 1
       @input_schema_depth = 'shallow'
       @output_schema = false
+      @validate_results = nil
+      @exception_reporter = nil
+      @allowed_origins = nil
+    end
+
+    def validate_results
+      @validate_results.nil? ? !Rails.env.production? : @validate_results
     end
 
     def input_schema_depth=(value)

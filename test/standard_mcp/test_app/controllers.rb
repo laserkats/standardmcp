@@ -72,3 +72,22 @@ end
 # No MCP intent: never opts in with allow_mcp.
 class PhotosController < ApplicationController
 end
+
+# An app-owned MCP endpoint, routed with `standard_mcp ..., to: 'mcp#handle'`.
+class McpController < ApplicationController
+  include StandardMCP::Endpoint
+end
+
+# A parent_controller that requires a bearer, for the default endpoint.
+class BearerRequiredController < ApplicationController
+  before_action :require_bearer
+
+  private
+
+  def require_bearer
+    return if current_account_id
+
+    response.headers['WWW-Authenticate'] = 'Bearer'
+    head :unauthorized
+  end
+end

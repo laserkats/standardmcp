@@ -41,8 +41,14 @@ require 'standard_mcp/test_app/models'
 # Test Application Controllers
 require 'standard_mcp/test_app/controllers'
 
+# The Railtie's to_prepare ran before ApplicationController existed.
+StandardMCP.define_server_controller!
+
 # Test Application Routes
 Rails.application.routes.draw do
+  standard_mcp '/mcp'
+  standard_mcp '/custom_mcp', to: 'mcp#handle', as: :custom_mcp
+
   standard_resources :accounts
   standard_resources :properties
   standard_resources :photos

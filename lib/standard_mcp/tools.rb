@@ -38,7 +38,12 @@ module StandardMCP
 
     class << self
       # Array of MCP::Tool subclasses for +request+ (an ActionDispatch::Request).
-      def for(request)
+      #
+      # +only+ is a tool name: just that tool is built (none when it doesn't
+      # exist). Building is what costs (schemas, descriptions), so a tools/call
+      # needn't pay for every tool. The per-request `allow_mcp` conditions
+      # still decide first, so a tool hidden from this caller is never built.
+      def for(request, only: nil)
         tools = Registry.allowed(request).flat_map do |klass, actions|
           # StandardAPI infers the model from the controller's name.
           raise Error, "#{klass.name} allows MCP actions but has no model" unless klass.model
@@ -46,7 +51,9 @@ module StandardMCP
           controller = Registry.controller_for(klass, request)
           # Total needs calculate, which may be hidden from this caller.
           countable = actions.include?(:calculate)
-          (actions & ACTIONS).map { |action| build(request, klass, controller, action, countable) }
+          wanted = (actions & ACTIONS)
+          wanted = wanted.select { |action| tool_name(klass, action) == only } if only
+          wanted.map { |action| build(request, klass, controller, action, countable) }
         end
 
         duplicates = tools.group_by(&:name_value).select { |_, group| group.size > 1 }.keys

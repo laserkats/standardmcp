@@ -17,6 +17,12 @@ class RegistryTest< ActiveSupport::TestCase
     assert_includes controllers, PropertiesController
   end
 
+  test "controllers excludes the MCP endpoint controllers" do
+    controllers = StandardMCP::Registry.controllers
+    refute_includes controllers, McpController
+    refute_includes controllers, StandardMCP::ServerController
+  end
+
   test "controllers excludes controllers that did not opt in" do
     controllers = StandardMCP::Registry.controllers
     refute_includes controllers, PhotosController

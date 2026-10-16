@@ -1,185 +1,229 @@
 # StandardMCP
 
-> Status: pre-release / work in progress. The API below is planned, not final.
+> Status: pre-release. The API may still change.
 
-StandardMCP exposes [StandardAPI](https://github.com/waratuman/standardapi)
-resources as [MCP](https://modelcontextprotocol.io) tools using the official
-`mcp` gem. Tool calls are dispatched in-process to the StandardAPI controller
-actions, so ACLs, masking, excludes and rendering are reused.
-
-## Install
-
-```ruby
-gem "standardmcp"
-```
-
-## Planned usage
+StandardMCP turns the [StandardAPI](https://github.com/waratuman/standardapi)
+controllers your Rails app already has into an [MCP](https://modelcontextprotocol.io)
+server, using the official `mcp` gem. You opt a controller in with one line;
+the gem builds the tools, schemas and descriptions from that controller, its
+ACL and your database comments, and runs every call through the controller's
+own action. Whatever StandardAPI enforces for your JSON API (permitted
+attributes, includes, orders, excludes, `mask_for`, limits, rendering) applies
+to MCP calls too, so there is one way in and out of the system.
 
 ```ruby
 class AccountsController < ApplicationController
   include StandardAPI::Controller
 
-  # Read-only for everyone.
   allow_mcp only: [:index, :show, :calculate]
-  # Writes only for admins.
-  allow_mcp only: [:create, :update], if: :admin?
 end
 
 # config/routes.rb
-standard_mcp "/mcp"
+standard_mcp '/mcp'
 ```
 
-`allow_mcp` takes `only:`, `except:`, `if:` and `unless:`, modelled on
-`before_action`. The controller must include `StandardAPI::Controller`.
+## Contents
 
-- Exposable actions are `index`, `show`, `create`, `update`, `destroy` and
-  `calculate`. Unknown names raise `ArgumentError`.
-- `only:` and `except:` are mutually exclusive. With neither, every exposable
-  action the controller actually has is covered.
-- `if:` / `unless:` accept a Symbol (a controller method, private allowed), a
-  Proc (zero arity runs with `instance_exec`, otherwise it is called with the
-  controller) or an Array of these. All `if:` must be truthy and all `unless:`
-  falsy.
-- `allow_mcp` can be called several times. An action is exposed when any rule
-  covers it and that rule's conditions pass. Subclasses inherit rules and may
-  add their own.
-- Conditions run per request on a controller instance bound to the MCP request,
-  so `current_user`, `request`, `params` and `headers` are available. When they
-  fail, the tool is hidden from `tools/list` (and refused on call).
-- Row-level restriction is not handled here; use StandardAPI's `mask_for`.
-- Table and column comments (Postgres) become tool and parameter descriptions.
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [What StandardAPI provides](#what-standardapi-provides)
+- [Exposing actions with `allow_mcp`](#exposing-actions-with-allow_mcp)
+- [The tools your app gets](#the-tools-your-app-gets)
+- [Resources and `describe`](#resources-and-describe)
+- [Application context from the database](#application-context-from-the-database)
+- [Mounting and authentication](#mounting-and-authentication)
+- [Configuration](#configuration)
+- [Auditing and verification](#auditing-and-verification)
+- [Development](#development)
 
-## Tools
+## Requirements
 
-One tool per allowed (controller, action). Controller paths become names
-(`admin/accounts` is `list_admin_accounts` and `get_admin_account`).
+- Ruby 3.2+, Rails 8.0+
+- StandardAPI 9.0+ (your controllers include `StandardAPI::Controller`, ACLs
+  in `app/controllers/acl`)
+- PostgreSQL: table and column comments are the application context, and the
+  filter operators are activerecord-filter's Postgres set. This is what the gem
+  is tested against.
 
-| Action      | Tool                | Arguments                                         |
-| ----------- | ------------------- | ------------------------------------------------- |
-| `index`     | `list_accounts`     | `where`, `order`, `include`, `limit`, `offset`, `distinct` |
-| `show`      | `get_account`       | `id`, `include`                                   |
-| `calculate` | `calculate_accounts`| `where`, `select`, `group_by`                     |
-| `create`    | `create_account`    | `account` (required), `include`                   |
-| `update`    | `update_account`    | `id`, `account` (both required), `include`        |
-| `destroy`   | `delete_account`    | `id`                                              |
+## Installation
 
-Annotations: reads are read-only and idempotent; create is neither destructive
-nor idempotent; update and delete are destructive and idempotent.
+StandardAPI 9 isn't released to RubyGems yet (RubyGems has 7.1.4), and neither
+is StandardMCP, so both come from git for now. Pin refs:
+
+```ruby
+# Gemfile
+gem 'standardapi', git: 'https://github.com/waratuman/standardapi.git', ref: '6222967041a6b0c243e1e8aec33dfc2eb13167aa'
+gem 'standardmcp', git: 'https://github.com/laserkats/standardmcp.git', ref: '<commit>'
+```
+
+Then:
+
+1. Mount the endpoint in `config/routes.rb`: `standard_mcp '/mcp'`.
+2. Opt controllers in with `allow_mcp` (below).
+3. Optionally add `config/initializers/standard_mcp.rb` (see
+   [Configuration](#configuration)).
+4. Comment your tables and columns, and check with `rake standard_mcp:lint`.
+5. Preview what a caller gets with `rake standard_mcp:tools`, then connect a
+   client (see [Try it](#try-it)).
+
+## What StandardAPI provides
+
+Every tool call is dispatched in-process to the controller action
+(`AccountsController.action(:index).call(env)`) with the caller's credentials,
+so the gem reuses StandardAPI rather than reimplementing it:
+
+| StandardAPI piece | What MCP gets from it |
+| --- | --- |
+| ACL `attributes` (strong params) | The write tools' typed attributes; anything else is rejected, and keys a per-record ACL drops come back as `ignored_attributes` |
+| ACL `nested` | Nested records in create/update, as StandardAPI accepts them (`photos`, `photo_ids`, foreign keys) |
+| ACL `includes` | The `include` argument and the associations `where` can filter on |
+| ACL `orders` | The `order` argument |
+| ACL `excludes` | Excluded attributes are absent from responses and from every schema and description |
+| `mask_for` | Row-level restriction on every read, count, update and delete; a masked id reads as "not found" |
+| `resource_limit` / `default_limit` | The `limit` maximum and default (`config.default_limit` when the controller has none) |
+| activerecord-filter (`where`) | Filtering with operator objects, checked against the model before the call |
+| `calculate` | `calculate_*` tools (count, sum, min, max, average, `group_by`) and the `total` of list pages |
+| jbuilder views (`_record`, includes, eager loading) | The JSON the tools return, identical to your JSON API |
+| `json_schema` view | Output schemas, when you turn them on |
+| Model validators | Input constraints that are safe to check up front (enums, length, numeric bounds, simple formats); the rest come back as validation errors |
+| Table, column and database comments | Tool, argument and server descriptions ([below](#application-context-from-the-database)) |
+
+The gem doesn't authenticate; your controller callbacks do, exactly as for an
+HTTP request ([Authentication](#authentication)).
+
+## Exposing actions with `allow_mcp`
+
+`allow_mcp` takes `only:`, `except:`, `if:` and `unless:`, like `before_action`:
+
+```ruby
+class PropertiesController < ApplicationController
+  include StandardAPI::Controller
+
+  # Reads for everyone who can reach the endpoint.
+  allow_mcp only: [:index, :show, :calculate]
+  # Writes only for admins.
+  allow_mcp only: [:create, :update, :destroy], if: :admin?
+end
+```
+
+- Exposable actions: `index`, `show`, `create`, `update`, `destroy`,
+  `calculate`. With neither `only:` nor `except:`, every one of them the
+  controller has is covered. `only:` with `except:`, or an unknown action,
+  raises `ArgumentError`.
+- `if:` / `unless:` take a Symbol (a controller method, private is fine), a
+  Proc (zero arity runs with `instance_exec`, otherwise it gets the controller)
+  or an Array of them. All `if:` must be truthy and all `unless:` falsy.
+- Several calls combine: an action is exposed when any rule covers it and that
+  rule's conditions pass. Subclasses inherit the rules and can add their own.
+- Conditions run per request, on a controller instance bound to the MCP
+  request, so `current_user`, `request`, `params` and `headers` work. A tool
+  whose conditions fail is left out of that caller's `tools/list`, and a call
+  to it is refused anyway.
+- Row-level restriction belongs in `mask_for`, as for your JSON API.
+
+## The tools your app gets
+
+One tool per allowed (controller, action), named from the controller path
+(`admin/accounts` gives `list_admin_accounts`, `get_admin_account`):
+
+| Action | Tool | Arguments |
+| --- | --- | --- |
+| `index` | `list_accounts` | `where`, `order`, `include`, `limit`, `offset`, `distinct` |
+| `show` | `get_account` | `id`, `include` |
+| `calculate` | `calculate_accounts` | `select` (required), `where`, `group_by` |
+| `create` | `create_account` | `account` (required), `include` |
+| `update` | `update_account` | `id`, `account` (both required), `include` |
+| `destroy` | `delete_account` | `id` |
+
+Plus `describe` ([below](#resources-and-describe)). Reads are annotated
+read-only and idempotent; create is neither destructive nor idempotent; update
+and delete are destructive and idempotent.
+
+Results are JSON as your API renders it, as both `structuredContent` and text:
+`{"records": [...], "offset": 0, "next_offset": 25, "total": 112}` for lists
+(`total` only when the caller may also use `calculate`; `next_offset` is null on
+the last page), `{"record": {...}}` for get, create and update, `{"result": ...}`
+for calculate and `{"success": true, "affected_rows": 1}` for delete.
+
+### Filtering
+
+`where` takes an operator object per column, and associations nest:
+
+```json
+{"where": {"size": {"gte": 1000}, "kind": {"in": ["office", "retail"]},
+           "name": {"not": null}, "account": {"name": {"ilike": "%acme%"}}}}
+```
+
+An array alternating filters with `"AND"`/`"OR"` combines them. By default the
+schema keeps `where` a plain object and its description lists the columns
+(type, enum values, comment), the operators per column type and the
+associations, which keeps `tools/list` small. Calls are checked against the
+model before they run, so an unknown column, an operator that doesn't fit the
+type or a bad enum value is a readable tool error, not an empty result. Set
+`input_schema_depth = 'deep'` to have the schema spell all of it out instead.
 
 ### Writes
 
-The record goes under its singular name, as StandardAPI's `params.require`
-wants it: `{"property": {"name": "Tower"}, "include": {"photos": true}}`. The
-attributes are the ACL's `attributes` list, typed from the columns with the
-column comments as descriptions, and the tool rejects anything else.
+The record goes under its singular name, as `params.require` expects:
+`{"property": {"name": "Tower", "kind": "office"}, "include": {"photos": true}}`.
 
-- `required` on create: a permitted NOT NULL column or presence-validated
-  attribute that has no default. An update needs at least one attribute and
-  none in particular.
-- Validators become keywords where that is safe for input: enums (AR enums and
-  unconditional `inclusion`), `length`, `numericality` bounds and `format`
-  (only when the Ruby regexp means the same in ECMA 262, else the description
-  says "Must match /.../"). Validators with `if:`, `unless:` or a non-matching
-  `on:` are left to Rails, whose errors come back as tool errors with `errors`.
-  `null` is offered only for nullable columns. Ids, timestamps, database-filled
-  and (on update) `attr_readonly` columns, and columns an ACL `excludes` hides,
-  are not accepted.
-- Nested attributes (an ACL `nested` list) are accepted as StandardAPI does:
-  the association as an object (or an array of objects), each with an optional
-  `id` to update an existing record, `<association>_ids`, and the foreign key
-  of a `belongs_to`. A nested collection replaces the whole set. With
-  `input_schema_depth = 'deep'` they are typed from the nested model's own ACL;
-  by default (`'shallow'`) the association is a loose object and its
-  description lists the permitted attributes (`name (type): comment`), while
-  the top-level attributes stay typed. StandardAPI and ActiveRecord check the
-  nested values then, and their problems come back as tool errors.
-- The ACL is asked for the schema without a record (`attributes(nil)`). A
-  per-record `attributes(record)` can therefore still drop a key the schema
-  accepted. StandardAPI drops such keys silently, so the result reports them as
-  `ignored_attributes` (`["size", "photos.internal_path"]`) when there are
-  any. For an update they are worked out from the record as StandardAPI finds
-  it (through the controller's own `resources`, so `mask_for` applies); a
-  create asks about a new record, nested records are always judged as new ones
-  and a lookup that fails falls back to the nil-record list.
-- A masked or missing id is `"Property not found"` for update and delete,
-  whatever the mask. Delete returns `{"success": true, "affected_rows": 1}`.
-  Constraints only the database knows (foreign key, NOT NULL, unique, out of
-  range) are tool errors in plain words, without SQL. A write a model callback
-  refuses (`throw :abort`) says why in the model's own errors:
-  `"Contact could not be deleted: Locked contacts cannot be deleted"` (just
-  `"Contact could not be deleted"` when it added none).
+- The attributes are the ACL's `attributes`, typed from the columns, with
+  their comments. Ids, timestamps, database-filled columns and excluded ones
+  aren't accepted.
+- Required on create: permitted NOT NULL or presence-validated attributes
+  without a default. An update needs at least one attribute.
+- Validators become input constraints where that's safe (enums, `length`,
+  `numericality` bounds, `format` when the regexp means the same in ECMA 262).
+  Conditional validators are left to Rails; their errors come back as tool
+  errors with `errors`.
+- Nested attributes (ACL `nested`) work as in StandardAPI: an object or array
+  of objects, each with an optional `id`, or `<association>_ids`. A nested
+  collection replaces the whole set.
+- The schema asks the ACL without a record. If a per-record
+  `attributes(record)` drops a key, the result lists it in
+  `ignored_attributes`.
+- A masked or missing id is `"Property not found"`. Database constraint
+  failures (foreign key, NOT NULL, unique, range) and model callbacks that
+  abort (`"Contact could not be deleted: ..."`) are tool errors in plain words,
+  without SQL.
 
-## Schema and records on demand
+## Resources and `describe`
 
-`tools/list` stays small because the tool schemas are shallow. The detail is
-one call or read away, and records can be attached as context.
+The tool schemas stay shallow; the full detail is one call or read away.
 
-### `describe` and `standardmcp://schema/{resource}`
+- **`describe`** takes `{"resource": "properties"}` (the controller path with
+  `/` as `_`; its enum lists the caller's own) and returns a compact document:
+  the table comment, the caller's tools, every column (type, nullable,
+  comment, enum, orderable, writable), every association (kind, the resource
+  serving it, whether it can be included, filtered or written through) and the
+  `where` rules once per column type. List, calculate, create and update
+  descriptions end with a pointer to it.
+- **`standardmcp://schema/{resource}`** is the same document as a resource
+  template, for clients that read resources.
+- **`standardmcp://<resource>/{id}`** (e.g. `standardmcp://accounts/42`) is a
+  template per controller the caller may `show`, so a user can attach a
+  record as context. Reading it is a dispatched `show`.
 
-`describe` takes `{"resource": "properties"}` and returns, as structured
-content (and as text), what the shallow schemas leave out: for every column its
-type, `nullable`, comment, `enum` and whether it is
-`orderable` or `writable`, for every association its `kind`, the `resource` that
-serves it, whether it can be included, filtered on or written through (`nested`),
-and the `where` rules (operators per type, AND/OR). A flag is present only when
-true and an empty value is left out. The resource is the controller path with
-`/` written as `_` (`admin_accounts`), the segment the tool names use; the
-`enum` of its argument lists the caller's own.
+Everything is built for the caller. A schema is readable when the caller has
+any MCP action on that controller; masked, missing, forbidden and unknown URIs
+all answer the same "Resource not found" (JSON-RPC -32602). Record reads have
+no `include` (the `mcp` gem only matches plain `{var}` placeholders). The
+endpoint serves templates only (`resources/list` is empty) and is stateless, so
+there are no subscriptions. How a client shows templates or lets the model read
+them is up to the client, which is why `describe` is also a tool.
 
-The same document is the resource template `standardmcp://schema/{resource}`,
-for clients that can read resources. Both are built for the caller: a controller
-is readable when the caller is allowed any MCP action on it, columns and
-associations an ACL `excludes` are absent, `tools` lists the caller's tools, and
-`writable` needs create or update. Anything else is "not found", the same
-answer as for a resource that doesn't exist.
+## Application context from the database
 
-The shallow `where` and the create/update descriptions end with a pointer
-(`Full column details: describe {"resource": "accounts"}.`), and the
-instructions have a line about `describe`: about 60 characters per description
-and 106 in the instructions for the sample app, plus the tool itself (about 490).
+The gem reads your application's context from Postgres comments, so the
+documentation lives with the schema and is read fresh on every request (no
+caching; a migration that changes a comment shows up immediately):
 
-### Records: `standardmcp://<resource>/{id}`
-
-For every controller that allows `show` to the caller there is a template such
-as `standardmcp://accounts/{id}` (`standardmcp://admin_accounts/{id}`): reading
-it returns the record as `application/json`, so a client can attach it as
-context. The read is a dispatched `show`, so `allow_mcp`, the ACL, excludes and
-`mask_for` apply exactly as for `get_account`. A record that is masked,
-missing, forbidden or on a controller the caller can't use is the same error as
-an unknown URI (`Resource not found: <uri>`, JSON-RPC -32602 with the URI in
-`data`: the `mcp` gem follows SEP-2164, not the older -32002), so neither the
-mask nor a hidden controller shows. Other client errors come back as -32602
-with their message, a server error as an internal error.
-
-- No `include`: the `mcp` gem only matches plain `{var}` expressions in a
-  template, not RFC 6570 query ones such as `{?include}`. A `{var}` matches one
-  path segment (no `/`) and is not percent-decoded.
-- `schema/{resource}` and `<resource>/{id}` share a shape, so a controller
-  whose resource name is `schema` that allows `show` raises when the templates
-  are built (like duplicate tool names do). Rename it, or serve only one of them
-  with `config.resources`.
-- The endpoint only has templates: `resources/list` is empty, and templates are
-  listed by `resources/templates/list`. It is stateless, so there are no
-  subscriptions or list-changed notifications. Whether and how a client lists
-  templates, lets a user attach a resource or lets the model read one is up to
-  the client, which is why `describe` is a tool too.
-
-`config.resources = []` serves no templates (and `resources` isn't advertised
-in `initialize`); `config.describe_tool = false` drops the tool and the
-pointers. `rake standard_mcp:tools URI=standardmcp://schema/accounts` prints what
-reading a URI returns.
-
-## Context from comments
-
-The gem takes the application's context from database comments (Postgres), so
-the documentation lives with the schema and can't drift from it:
-
-| Comment            | Becomes                                                                 |
-| ------------------ | ----------------------------------------------------------------------- |
-| database           | the opening paragraph of the server instructions                        |
-| table              | the tool descriptions, and the table's line in the instructions         |
-| column             | the description of the column in `where`, in write inputs and nested records |
-| foreign key column | the description of its association (else the associated table's comment) |
+| Comment | Read with | Becomes |
+| --- | --- | --- |
+| Database | `connection.database_comment` (StandardAPI) | The opening paragraph of the server instructions |
+| Table | `connection.table_comment(table)` | Tool descriptions, the table's line in the instructions, the `describe` document |
+| Column | `column.comment` | The column's line in `where`, its description in write inputs and nested records, the `describe` document |
+| Foreign key column | `column.comment` | Its association's description (else the associated table's comment) |
 
 Write them in migrations:
 
@@ -193,17 +237,14 @@ change_table_comment :accounts, from: nil, to: 'A customer organization.'
 change_column_comment :accounts, :notes, from: nil, to: 'Free-form notes from sales.'
 ```
 
-The database comment is set with `COMMENT ON DATABASE app IS '...'` (StandardAPI
-reads it back as `connection.database_comment`).
-
-Say what a value means rather than what its column is called: the lifecycle
-behind a `status`, the unit of a `size`, how a hierarchy is stored. `rake
-standard_mcp:lint` lists what is still missing.
+The database comment is `COMMENT ON DATABASE my_app IS '...'`. Write what a
+value means rather than what the column is called: the lifecycle behind a
+`status`, the unit of a `size`, how a hierarchy is stored.
 
 ### Server instructions
 
-The instructions sent when a client connects are generated from those comments,
-for the request at hand (what `allow_mcp` hides from the caller is left out):
+When a client connects, it gets instructions generated from those comments for
+that caller (what `allow_mcp` hides is left out):
 
 ```
 Property management data: customer accounts, the properties they own and the people to reach.
@@ -215,40 +256,106 @@ properties: A real estate asset owned by an account. Tools: list_properties, get
 Conventions: list_* tools return one page; pass the result's next_offset as offset to get the next. Filters (where) take operator objects such as {"size": {"gte": 1000}}; a tool's where description lists its columns and operators. include embeds associations in the result. describe {"resource": "accounts"} returns a resource's columns, types, enums, operators and associations.
 ```
 
-A model without a table comment is still listed, with its tools. The operators
-and columns stay in each tool's `where` description, so every tool is
-self-contained and the instructions stay short.
-
-`config.instructions` changes them:
+Domain knowledge that doesn't fit a single column goes in
+`config.instructions`:
 
 ```ruby
-# Add domain context to the generated text (a callable taking two arguments):
+# Add to the generated text (a callable taking two arguments):
 config.instructions = ->(request, default) do
-  "#{default}\n\nSizes are in square feet. A TIM is a tenant improvement allowance."
+  "#{default}\n\nSizes are in square feet. Markets are a hierarchy: US|California|San Francisco."
 end
 
-# Replace it (a String, or a callable taking the request):
-config.instructions = 'Use these tools carefully.'
-config.instructions = ->(request) { "Hello #{request.headers['X-Who']}" }
-
-# Send none:
-config.instructions = false
+config.instructions = 'Replace them entirely.'          # or ->(request) { ... }
+config.instructions = false                              # send none
 ```
 
-A callable that returns nothing falls back to the generated text. The text is
-only worked out for `initialize` (and `server/discover`), not for every call.
+## Mounting and authentication
 
-## Checking the result
+```ruby
+# config/routes.rb
+standard_mcp '/mcp'
+```
 
-Both tasks run in the host app (`bundle exec rake ...`).
+routes POST, GET and DELETE `/mcp` (named `standard_mcp`) to
+`StandardMCP::ServerController#handle`, which inherits from
+`config.parent_controller` (`ApplicationController` by default). To own the
+controller, include the endpoint and route to it:
 
-### `rake standard_mcp:lint`
+```ruby
+class McpController < ApplicationController
+  include StandardMCP::Endpoint
+  before_action :authenticate_mcp_client!
+end
 
-Lists the tables and columns exposed through MCP tools that have no comment:
-every MCP-enabled controller's model, and the models reachable through its
-permitted includes and nested attributes. A column counts when the ACL's
-`excludes` doesn't hide it; `id`, `created_at` and `updated_at` are skipped
-(`config.lint_ignore_columns`, or `IGNORE_COLUMNS=id,created_at` for one run).
+# config/routes.rb
+standard_mcp '/mcp', to: 'mcp#handle'
+```
+
+The endpoint is the stateless Streamable HTTP transport with plain JSON
+responses: a server and its tools are built per request (a `tools/call` builds
+only the tool it names), with no sessions or SSE stream; GET answers 405.
+
+### Authentication
+
+- The gem does none. The controller's callbacks (its parent's
+  `before_action`s) run first: authenticate there and render a 401 with a
+  `WWW-Authenticate` header for MCP clients.
+- Tool calls run in-process with the caller's `Authorization`, `Cookie`,
+  remote address and host, so `current_user`, ACLs and `mask_for` resolve as
+  for a normal request. `config.dispatch_env` adds Rack env entries (e.g. an
+  internal-user key your `current_user` honors).
+- CSRF: the endpoint skips forgery protection, which is safe because the
+  transport only accepts `Content-Type: application/json`, which a cross-site
+  form can't send. The in-process calls still run your `protect_from_forgery`,
+  so writes need bearer-style auth or a `verified_request?` that honors a key
+  set through `dispatch_env`; otherwise a write is a tool error.
+- Origin: a request with an `Origin` header must be same-origin or match
+  `config.allowed_origins`, else 403. Requests without one (non-browser
+  clients) pass. Host checks (DNS rebinding) are Rails' `config.hosts`.
+
+## Configuration
+
+```ruby
+# config/initializers/standard_mcp.rb
+StandardMCP.configure do |config|
+  config.server_name = 'my-app'
+  config.allowed_origins = ['https://claude.ai']
+  config.instructions = ->(request, default) { "#{default}\n\n..." }
+  config.exception_reporter = ->(exception, server_context) { Rails.error.report(exception) }
+end
+```
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `server_name` | the app's module name | Reported to clients on `initialize` |
+| `server_version` | the gem's version | Reported to clients on `initialize` |
+| `parent_controller` | `'ApplicationController'` | What `StandardMCP::ServerController` inherits from (its callbacks authenticate) |
+| `instructions` | `nil` (generated) | A String or `->(request)` replaces the generated text; `->(request, default)` extends it; `false` sends none |
+| `dispatch_env` | `->(request) { {} }` | Extra Rack env for the in-process calls |
+| `allowed_origins` | `nil` | Origins accepted besides the endpoint's own: exact Strings (case-insensitive) or Regexps, anchored to the whole origin |
+| `default_limit` | `25` | Page size when neither the controller's `default_limit` nor the caller sets one |
+| `input_schema_depth` | `'shallow'` | `'shallow'`: `where` and nested write records are loose objects described in prose, and calls are checked before dispatch. `'deep'`: both are fully typed in the schema |
+| `where_depth` | `1` | Deep mode only: association levels `where` spells out, bounded by the ACL's includes |
+| `output_schema` | `false` | Declare an `outputSchema` per tool (from StandardAPI's `json_schema` view; about a quarter more `tools/list`). Results carry `structuredContent` either way |
+| `validate_results` | on outside production | Check results against the output schema (needs `output_schema`) |
+| `resources` | `%i[schema records]` | Resource templates served; `[]` for none (and `resources` isn't advertised) |
+| `describe_tool` | `true` | The `describe` tool and the pointers to it |
+| `resource_scheme` | `'standardmcp'` | URI scheme of the templates (RFC 3986) |
+| `exception_reporter` | `nil` (the mcp gem's) | Called with unexpected errors |
+| `lint_ignore_columns` | `%w[id created_at updated_at]` | Columns `standard_mcp:lint` doesn't expect comments on |
+
+Argument validation against each tool's input schema is always on.
+
+## Auditing and verification
+
+Run these in your app (`bundle exec rake ...`).
+
+### `rake standard_mcp:lint`: missing context
+
+Lists the tables and columns exposed through MCP that have no comment: every
+MCP-enabled controller's model and the models reachable through its permitted
+includes and nested attributes, minus ACL-excluded columns and
+`lint_ignore_columns`. A missing database comment is reported too.
 
 ```
 $ bundle exec rake standard_mcp:lint
@@ -264,19 +371,20 @@ photos (Photo)
 Summary: 2 missing comments (2 columns) across 4 tables checked
 ```
 
-The exit status is 0 unless `STRICT=1` is set and something is missing, which
-makes it usable in CI (`STRICT=1 bundle exec rake standard_mcp:lint`). A missing
-database comment is reported too; `DATABASE_COMMENT=0` skips that. The logic is
-`StandardMCP::Lint.run(io: $stdout, strict: false)`, which returns the findings.
+| ENV | Effect |
+| --- | --- |
+| `STRICT=1` | Exit 1 when anything is missing (for CI) |
+| `IGNORE_COLUMNS=id,created_at` | Override `lint_ignore_columns` for one run |
+| `DATABASE_COMMENT=0` | Don't check the database comment |
 
-ACL methods need a request, so they are evaluated for an anonymous one. A
-controller whose `attributes`, `includes` or `excludes` depend on the caller may
-expose more to some callers than is checked here.
+ACL methods are evaluated for an anonymous request, so ACLs that depend on the
+caller may expose more to some callers than is checked. In code:
+`StandardMCP::Lint.run(io: $stdout, strict: false)` returns the findings.
 
-### `rake standard_mcp:tools`
+### `rake standard_mcp:tools`: what a caller sees
 
-Prints the server instructions, `tools/list` and resource templates a caller
-would get, without a client:
+Prints the server instructions, `tools/list` and resource templates for a
+caller, without a client:
 
 ```
 $ HEADERS='X-MCP-Writes: true' FORMAT=summary bundle exec rake standard_mcp:tools
@@ -290,137 +398,39 @@ describe                 494  Describe a resource: its columns with types, enums
 3 resource templates, 719 characters: standardmcp://schema/{resource}, standardmcp://accounts/{id}, standardmcp://properties/{id}
 ```
 
-- `HEADERS`: `Name: value` pairs separated by `;` or newlines (a value that
-  contains `;` goes on a line of its own).
-- `FORMAT`: `json` (the default: `{"instructions": ..., "tools": [...],
-  "resourceTemplates": [...]}`) or `summary` (a line per tool with its size in
-  compact-JSON characters and the first sentence of its description, then the
-  total and a line for the resource templates).
-- `TOOL=list_accounts`: only that tool (its full definition for `json`).
-- `URI=standardmcp://schema/accounts`: only what reading that URI returns
-  (pretty-printed), or the "Resource not found" it would answer with.
+| ENV | Effect |
+| --- | --- |
+| `HEADERS` | `Name: value` pairs separated by `;` or newlines (a value containing `;` goes on its own line) |
+| `FORMAT=json` (default) / `summary` | Full `{"instructions", "tools", "resourceTemplates"}` JSON, or a line per tool with its size in compact-JSON characters |
+| `TOOL=list_accounts` | Only that tool |
+| `URI=standardmcp://schema/accounts` | What reading that URI returns (or the "Resource not found" it answers) |
 
-Per-request ACLs and `allow_mcp` conditions are evaluated with the given
-headers only: there is no session, and no cookies unless you pass a `Cookie`
-header. The call is `StandardMCP::Preview.call(headers:, format:, tool:, uri:, io:)`.
-
-## Mounting the endpoint
-
-```ruby
-# config/routes.rb
-standard_mcp '/mcp'
-```
-
-routes POST, GET and DELETE `/mcp` (named `standard_mcp`) to
-`StandardMCP::ServerController#handle`. That controller inherits from
-`config.parent_controller` (`ApplicationController` by default) and is defined
-again after every code reload.
-
-To own the controller (to add callbacks, say), include the endpoint and route
-to it:
-
-```ruby
-class McpController < ApplicationController
-  include StandardMCP::Endpoint
-end
-
-# config/routes.rb
-standard_mcp '/mcp', to: 'mcp#handle'
-```
-
-The endpoint is stateless and answers with plain JSON: a server (and its tools)
-is built for every request, so what a caller sees depends on that caller. There
-are no sessions, no SSE stream and no server-initiated messages; GET answers 405.
-A `tools/call` builds only the tool it names.
-
-### Authentication
-
-The gem does no authentication. Callbacks of the controller (its parent's
-`before_action`s) run first, so authenticate there and render a 401 (with a
-`WWW-Authenticate` header) for MCP clients; `config.parent_controller` can point
-at a controller that does only that. Tool calls then run in-process with the
-caller's credentials (Authorization, Cookie, remote address, host), so
-`current_user`, ACLs and `mask_for` resolve as for a normal request.
-`config.dispatch_env` adds more Rack env entries (an internal-user key, say).
-
-- CSRF: the endpoint skips forgery protection, which is safe because the
-  transport only accepts `Content-Type: application/json`, which a cross-site
-  form or no-preflight request can't send. The in-process calls themselves run
-  your `protect_from_forgery` like any request, so write tools need
-  bearer-style authentication or a `verified_request?` that honors a key set
-  through `dispatch_env`; otherwise a write comes back as a tool error.
-- Origin: a request with an `Origin` header must be same-origin or match
-  `config.allowed_origins`, else 403. Requests without one (non-browser
-  clients) pass.
-- Host (DNS rebinding): left to Rails; set `config.hosts` in production.
+Conditions and ACLs see only the headers you pass: no session, and no cookies
+unless you pass a `Cookie` header. Use it to check per-role hiding (run it with
+an admin's and a viewer's token) and to keep an eye on `tools/list` size. In
+code: `StandardMCP::Preview.call(headers:, format:, tool:, uri:, io:)`.
 
 ### Try it
+
+With the app running:
 
 ```
 npx @modelcontextprotocol/inspector
 ```
 
-and connect to `http://localhost:3000/mcp` with the "Streamable HTTP" transport
-(add an `Authorization` header if your app needs one).
+Connect to `http://localhost:3000/mcp` with the "Streamable HTTP" transport,
+adding an `Authorization` header if your app needs one.
 
-## Configuration
+### Result validation in development
 
-```ruby
-StandardMCP.configure do |config|
-  config.server_name = 'my-app'              # default: the app's module name
-  config.server_version = '1.0.0'            # default: the gem's version
-  config.parent_controller = 'ApplicationController'
-  config.instructions = ->(request, default) { "#{default}\n\n..." } # default: generated from comments; see above
-  config.lint_ignore_columns = %w[id created_at updated_at]
-  config.dispatch_env = ->(request) { {} }
-  config.default_limit = 25
-  config.input_schema_depth = 'shallow'      # or 'deep'
-  config.where_depth = 1                     # only used by 'deep'
-  config.output_schema = false
-  config.validate_results = nil              # default: on outside production
-  config.allowed_origins = nil               # e.g. ['https://claude.ai', /\Ahttps:\/\/.*\.example\.com\z/]
-  config.resources = %i[schema records]      # resource templates served; [] for none
-  config.describe_tool = true                # the describe tool and the pointers to it
-  config.resource_scheme = 'standardmcp'     # scheme of the resource URIs
-  config.exception_reporter = ->(exception, server_context) { Rails.error.report(exception) }
-end
-```
-
-- `input_schema_depth`: `'shallow'` leaves `where` a bare object and lists the
-  filterable columns in the tool description (a fraction of the tokens; calls are
-  checked against the model before they run), and likewise leaves the nested
-  records of a write loose. `'deep'` spells out `where` in the schema, nested
-  associations up to `where_depth`, and the nested records of a write, and the
-  server rejects bad filters and nested values by schema validation.
-- `output_schema`: declare an `outputSchema` per tool (about a quarter more
-  `tools/list`). `structuredContent` is returned either way.
-- `validate_results`: check results against the output schema; only has an
-  effect with `output_schema`.
-- `default_limit`: page size for `index` when neither the controller nor the
-  caller sets one.
-- `allowed_origins`: Strings (exact) and/or Regexps accepted besides the
-  endpoint's own origin; nil accepts only that. Regexps are anchored to the
-  whole origin, so `/https:\/\/[a-z]+\.example\.com/` won't accept
-  `https://app.example.com.evil.example`.
-- `instructions`: nil generates them from the comments; a String or a callable
-  taking the request replaces that, a callable taking the request and the
-  generated text adds to it, false sends none.
-- `resources`: the resource templates served, an Array of Symbols or Strings:
-  `schema` (`standardmcp://schema/{resource}`) and `records`
-  (`standardmcp://<resource>/{id}` per controller allowing show); `[]` serves
-  none and `initialize` stops advertising `resources`.
-- `describe_tool`: lists the `describe` tool, and the pointers to it in the
-  shallow `where` and create/update descriptions and in the instructions.
-- `resource_scheme`: the URI scheme of the templates; letters, digits, `+`, `-`
-  and `.` (RFC 3986), starting with a letter.
-- `lint_ignore_columns`: columns `standard_mcp:lint` doesn't expect a comment on.
-- `exception_reporter`: called with unexpected errors; nil keeps the mcp gem's.
-
-Argument validation against the tool's input schema is always on.
+`config.output_schema = true` makes the tools declare output schemas, and
+`validate_results` (on outside production) then checks every result against
+them, which catches drift between the schemas and what your views render.
 
 ## Development
 
-Requires a local Postgres. The test app uses the `standardmcp-test` database.
+Working on the gem itself needs a local Postgres; the test app uses the
+`standardmcp-test` database.
 
 ```
 bundle install

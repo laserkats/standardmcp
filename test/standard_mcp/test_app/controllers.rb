@@ -69,6 +69,22 @@ class PropertiesController < ApplicationController
   end
 end
 
+# Write-only tools, including the only destroy. Rows are masked to the bearer's
+# account, so a record of another account is as good as missing.
+class ContactsController < ApplicationController
+  allow_mcp only: [:create, :update, :destroy], if: :mcp_writes?
+
+  def mask_for(table_name)
+    { account_id: current_account_id } if table_name.to_s == 'contacts' && current_account_id
+  end
+
+  private
+
+  def mcp_writes?
+    request.headers['X-MCP-Writes'] == 'true'
+  end
+end
+
 # No MCP intent: never opts in with allow_mcp.
 class PhotosController < ApplicationController
 end

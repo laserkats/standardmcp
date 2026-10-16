@@ -13,6 +13,12 @@ FactoryBot.define do
     description { Faker::Lorem.paragraph }
   end
 
+  factory :contact do
+    account
+    name  { Faker::Name.name }
+    email { Faker::Internet.email }
+  end
+
   factory :photo do
     property
     format        { %w(jpg png tiff).sample }

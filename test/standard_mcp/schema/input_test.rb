@@ -61,6 +61,68 @@ class SchemaInputDeepController < ApplicationController
   end
 end
 
+# Write schemas: attributes the ACL lists without a column, Hash entries,
+# per-request attributes, excludes and nested associations.
+class SchemaInputWritesController < ApplicationController
+  def self.model
+    Property
+  end
+
+  def property_attributes(record = nil)
+    list = [:name, :id, :created_at, :updated_at, :listed_at, :rent, { tags: [] }, { metadata: {} }]
+    list << :size if request.headers['X-Admin'] == 'true'
+    list
+  end
+
+  def property_excludes(record = nil)
+    request.headers['X-Nested'] == 'true' ? {} : { rent: true, photos: true }
+  end
+
+  # account_id isn't permitted above, yet StandardAPI takes it for a nested account.
+  def nested_property_attributes
+    request.headers['X-Nested'] == 'true' ? [:photos, :account] : [:photos]
+  end
+end
+
+# Validators that depend on the record or the context, and attributes that
+# aren't columns.
+class SchemaInputQuirk < ActiveRecord::Base
+  self.table_name = 'contacts'
+
+  attribute :floors, :integer
+
+  validates :email, presence: true, if: -> { false }
+  validates :email, format: { with: /\A(?<user>\w+)@x\z/ }, allow_nil: true
+  validates :role, inclusion: { in: %w[a b] }, on: :create
+  validates :age, numericality: { greater_than: ->(_record) { 1 } }, allow_nil: true
+  validates :account_id, presence: true, on: :update
+end
+
+class SchemaInputQuirkController < ApplicationController
+  def self.model
+    SchemaInputQuirk
+  end
+
+  def schema_input_quirk_attributes(record = nil)
+    [:email, :role, :age, :account_id, :nickname, :floors]
+  end
+end
+
+# Accounts nest properties and properties nest their account.
+class SchemaInputCycleController < ApplicationController
+  def self.model
+    Account
+  end
+
+  def nested_account_attributes
+    [:properties]
+  end
+
+  def nested_property_attributes
+    [:account]
+  end
+end
+
 class SchemaInputTest < ActiveSupport::TestCase
 
   # The typed filters; the shallow default is covered by schema/where_test.rb.
@@ -142,10 +204,320 @@ class SchemaInputTest < ActiveSupport::TestCase
     assert_equal schema(AccountsController, :show), schema(AccountsController, 'show')
   end
 
-  test "writes are not implemented yet" do
-    %i[create update destroy].each do |action|
-      assert_raises(NotImplementedError) { schema(PropertiesController, action) }
-    end
+  test "create has the expected shape" do
+    s = schema(PropertiesController, :create)
+
+    assert_equal 'object', s['type']
+    assert_equal ['property'], s['required']
+    assert_equal false, s['additionalProperties']
+    assert_equal %w[property include], s['properties'].keys
+  end
+
+  test "update has the expected shape" do
+    s = schema(PropertiesController, :update)
+
+    assert_equal %w[id property], s['required']
+    assert_equal false, s['additionalProperties']
+    assert_equal %w[id property include], s['properties'].keys
+    assert_equal 'integer', s.dig('properties', 'id', 'type')
+  end
+
+  test "destroy takes only an id" do
+    s = schema(ContactsController, :destroy)
+
+    assert_equal ['id'], s['required']
+    assert_equal false, s['additionalProperties']
+    assert_equal ['id'], s['properties'].keys
+    assert_equal 'integer', s.dig('properties', 'id', 'type')
+    refute s.dig('properties', 'id').key?('pattern')
+  end
+
+  test "destroy keeps a string id from naming several records" do
+    # StandardAPI deletes every id in a comma-separated list.
+    Account.stubs(:primary_key).returns('name')
+    id = schema(SchemaInputNoIncludesController, :destroy).dig('properties', 'id')
+
+    assert_equal 'string', id['type']
+    assert_equal '^[^,]+$', id['pattern']
+    assert JSONSchemer.schema(id).valid?('abc')
+    refute JSONSchemer.schema(id).valid?('1,2')
+  end
+
+  test "the record goes under its singular name, as StandardAPI requires" do
+    assert_equal %w[contact include], schema(ContactsController, :create)['properties'].keys
+    assert_equal %w[id contact include], schema(ContactsController, :update)['properties'].keys
+  end
+
+  # --- writes: attributes
+
+  def record(action, klass = PropertiesController, headers = {})
+    s = schema(klass, action, headers)
+    s['properties'].fetch(klass.model.model_name.singular)
+  end
+
+  test "attributes are the ACL's permit list, typed like the json schema and described by their comments" do
+    attributes = record(:create)['properties']
+
+    assert_equal %w[account_id name kind size description available built_on rent photos photo_ids], attributes.keys
+    assert_equal({ 'description' => 'The account that owns this property.', 'type' => ['integer', 'null'] }, attributes['account_id'])
+    assert_equal({ 'description' => 'Marketing name of the property.', 'type' => 'string' }, attributes['name'])
+    assert_equal ['boolean', 'null'], attributes['available']['type']
+    assert_equal ['string', 'null'], attributes['built_on']['type']
+    assert_equal 'date', attributes['built_on']['format']
+    assert_equal ['number', 'null'], attributes['rent']['type']
+    assert_equal 'Whether the property can be leased now.', attributes['available']['description']
+    assert_equal false, record(:create)['additionalProperties']
+  end
+
+  test "an AR enum is an enum, with null only because the column is nullable" do
+    kind = record(:create)['properties']['kind']
+
+    assert_equal ['string', 'null'], kind['type']
+    assert_equal ['office', 'retail', 'industrial', nil], kind['enum']
+  end
+
+  test "an inclusion validator is an enum, and a NOT NULL column doesn't offer null" do
+    role = record(:create, ContactsController)['properties']['role']
+
+    assert_equal 'string', role['type']
+    assert_equal %w[member admin], role['enum']
+  end
+
+  test "null is offered only for nullable columns" do
+    attributes = record(:create, ContactsController)['properties']
+
+    assert_equal 'string', attributes['name']['type']
+    assert_equal ['string', 'null'], attributes['email']['type']
+    assert_equal ['integer', 'null'], attributes['age']['type']
+  end
+
+  test "length, numericality and format validators become keywords" do
+    attributes = record(:create, ContactsController)['properties']
+
+    assert_equal 50, attributes['name']['maxLength']
+    assert_equal '^[^@\s]+@[^@\s]+$', attributes['email']['pattern']
+    assert_equal 0, attributes['age']['minimum']
+    assert_equal 150, attributes['age']['exclusiveMaximum']
+  end
+
+  test "required is a permitted NOT NULL column or presence validator without a default" do
+    assert_equal ['name'], record(:create)['required']
+    # role is NOT NULL but defaults to member.
+    assert_equal ['name'], record(:create, ContactsController)['required']
+    assert_equal %w[name], StandardMCP::Schema::Attributes.required(controller(ContactsController), Contact)
+    refute record(:create, AccountsController).key?('required')
+  end
+
+  test "an update has no required attributes but needs at least one" do
+    update = record(:update)
+
+    refute update.key?('required')
+    assert_equal 1, update['minProperties']
+    refute record(:create).key?('minProperties')
+    # Presence still rules out null.
+    assert_equal 'string', update['properties']['name']['type']
+  end
+
+  test "ids, timestamps and database-filled columns are not writable even when the ACL lists them" do
+    attributes = record(:create, SchemaInputWritesController)['properties']
+
+    refute attributes.key?('id')
+    refute attributes.key?('created_at')
+    refute attributes.key?('updated_at')
+    assert attributes.key?('listed_at')
+  end
+
+  test "attr_readonly columns are writable on create only" do
+    Property.stubs(:readonly_attributes).returns(['size'])
+
+    assert record(:create)['properties'].key?('size')
+    refute record(:update)['properties'].key?('size')
+  end
+
+  test "ACL excludes remove columns and nested associations" do
+    attributes = record(:create, SchemaInputWritesController)['properties']
+
+    refute attributes.key?('rent')
+    refute attributes.key?('photos')
+    refute attributes.key?('photo_ids')
+  end
+
+  test "Hash entries in the permit list count by name" do
+    attributes = record(:create, SchemaInputWritesController)['properties']
+
+    assert_equal ['array', 'null'], attributes['tags']['type']
+    assert_equal({ 'type' => 'string' }, attributes['tags']['items'])
+    # json holds any JSON value.
+    assert_equal({ 'description' => 'Unstructured attributes from the source system.' }, attributes['metadata'])
+  end
+
+  test "a permitted name that is not a column is accepted untyped, or typed by its attribute" do
+    attributes = record(:create, SchemaInputQuirkController)['properties']
+
+    assert_equal({}, attributes['nickname'])
+    assert_equal({ 'type' => 'integer' }, attributes['floors'])
+  end
+
+  test "the schema follows the caller's ACL" do
+    assert_includes record(:create, SchemaInputWritesController, 'X-Admin' => 'true')['properties'].keys, 'size'
+    refute_includes record(:create, SchemaInputWritesController)['properties'].keys, 'size'
+  end
+
+  test "validators that depend on the record or the context are left to Rails" do
+    attributes = record(:create, SchemaInputQuirkController)['properties']
+
+    # Conditional presence: not required, still nullable.
+    assert_equal ['string', 'null'], attributes['email']['type']
+    refute record(:create, SchemaInputQuirkController).key?('required')
+    # on: :create inclusion, a lambda bound, and a regexp ECMA can't match the same way.
+    refute attributes['role'].key?('enum')
+    refute attributes['age'].key?('exclusiveMinimum')
+    refute attributes['email'].key?('pattern')
+    assert_includes attributes['email']['description'], 'Must match /\A(?<user>\w+)@x\z/.'
+  end
+
+  test "a presence validator on: :update needs no value on create" do
+    create = record(:create, SchemaInputQuirkController)['properties']['account_id']
+    update = record(:update, SchemaInputQuirkController)['properties']['account_id']
+
+    assert_equal ['integer', 'null'], create['type']
+    assert_equal 'integer', update['type']
+    refute record(:create, SchemaInputQuirkController).key?('required')
+  end
+
+  test "a regexp is translated to ECMA only when it matches the same strings" do
+    ecma = ->(regexp) { StandardMCP::Schema::Attributes.send(:ecma, regexp) }
+
+    assert_equal '^ab$', ecma.(/\Aab\z/)
+    assert_equal '^(?:a|b)+\d{2,3}$', ecma.(/\A(?:a|b)+\d{2,3}\z/)
+    assert_equal '^(?=a)a$', ecma.(/\A(?=a)a\z/)
+    assert_nil ecma.(/a/i)
+    assert_nil ecma.(/a b/x)
+    assert_nil ecma.(/(?<n>a)/)
+    assert_nil ecma.(/(?<=a)b/)
+    assert_nil ecma.(/(?i)a/)
+    assert_nil ecma.(/[[:alpha:]]/)
+    assert_nil ecma.(/\h/)
+    assert_nil ecma.(/\Aa\Z/)
+    assert_nil ecma.(/a{,3}/)
+    assert_nil ecma.(/\\A/)
+  end
+
+  test "the schema validates calls the way the validators would" do
+    s = schema(ContactsController, :create)
+    contact = { name: 'Pat', email: 'pat@example.com', role: 'admin', age: 30 }
+
+    assert valid?(s, { contact: contact })
+    assert valid?(s, { contact: { name: 'Pat', email: nil, age: nil } })
+    refute valid?(s, { contact: {} })
+    refute valid?(s, { contact: contact.merge(name: nil) })
+    refute valid?(s, { contact: contact.merge(name: 'x' * 51) })
+    refute valid?(s, { contact: contact.merge(email: 'nope') })
+    refute valid?(s, { contact: contact.merge(role: 'owner') })
+    refute valid?(s, { contact: contact.merge(age: -1) })
+    refute valid?(s, { contact: contact.merge(age: 150) })
+    refute valid?(s, { contact: contact.merge(age: '30') })
+    refute valid?(s, { contact: contact.merge(created_at: '2020-01-01T00:00:00Z') })
+    refute valid?(s, { contact: contact.merge(id: 1) })
+    refute valid?(s, { contact: contact.merge(secret: 1) })
+    refute valid?(s, { name: 'Pat' })
+  end
+
+  test "an update schema accepts a partial record and rejects an empty one" do
+    s = schema(ContactsController, :update)
+
+    assert valid?(s, { id: 1, contact: { name: 'Sam' } })
+    assert valid?(s, { id: 1, contact: { email: nil } })
+    refute valid?(s, { id: 1, contact: {} })
+    refute valid?(s, { contact: { name: 'Sam' } })
+    refute valid?(s, { id: 'one', contact: { name: 'Sam' } })
+    refute valid?(s, { id: 1 })
+  end
+
+  test "include is the same as show's" do
+    show = schema(PropertiesController, :show)['properties']['include']
+
+    assert_equal show, schema(PropertiesController, :create)['properties']['include']
+    assert_equal show, schema(PropertiesController, :update)['properties']['include']
+    assert valid?(schema(PropertiesController, :create), { property: { name: 'A' }, include: { photos: true } })
+    refute valid?(schema(PropertiesController, :create), { property: { name: 'A' }, include: { nope: true } })
+  end
+
+  test "a controller without an include list has no include argument" do
+    assert_equal ['account'], schema(SchemaInputNoIncludesController, :create)['properties'].keys
+  end
+
+  # --- writes: nested attributes
+
+  test "deep mode types a nested collection, its attributes, and ids" do
+    s = schema(PropertiesController, :create)
+    photos = s.dig('properties', 'property', 'properties', 'photos')
+
+    assert_equal 'array', photos['type']
+    assert_includes photos['description'], 'Replaces the whole set'
+    assert_includes photos['description'], 'An image attached to a property.'
+    item = photos['items']
+    assert_equal 'object', item['type']
+    assert_equal false, item['additionalProperties']
+    assert_equal %w[id property_id format caption], item['properties'].keys
+    assert_equal %w[jpg png tiff], item['properties']['format']['enum'] - [nil]
+    refute item.key?('required')
+    assert_equal({ 'type' => 'array', 'items' => { 'type' => 'integer' } },
+      s.dig('properties', 'property', 'properties', 'photo_ids').slice('type', 'items'))
+
+    assert valid?(s, { property: { name: 'A', photos: [{ caption: 'x' }, { id: 3, format: 'png' }, { id: 4 }] } })
+    refute valid?(s, { property: { name: 'A', photos: [{ format: 'bmp' }] } })
+    refute valid?(s, { property: { name: 'A', photos: [{ internal_path: 'x' }] } })
+    refute valid?(s, { property: { name: 'A', photos: 'x' } })
+    refute valid?(s, { property: { name: 'A', photos: nil } })
+  end
+
+  test "shallow mode keeps the attributes typed and the association loose, described compactly" do
+    StandardMCP.config.input_schema_depth = 'shallow'
+    s = schema(PropertiesController, :create)
+    photos = s.dig('properties', 'property', 'properties', 'photos')
+
+    assert_equal({ 'type' => 'object' }, photos['items'])
+    assert_equal 'array', photos['type']
+    assert_includes photos['description'],
+      'Attributes: id, property_id (integer): The property this photo depicts; format (jpg|png|tiff): Image file format; caption (string).'
+    assert_equal ['integer', 'null'], s.dig('properties', 'property', 'properties', 'size', 'type')
+    assert_equal ['name'], s.dig('properties', 'property', 'required')
+
+    assert valid?(s, { property: { name: 'A', photos: [{ anything: 1 }] } })
+    refute valid?(s, { property: { name: 'A', photos: ['x'] } })
+    refute valid?(s, { property: { name: 'A', size: 'big' } })
+  end
+
+  test "shallow and deep agree on everything but the nested objects" do
+    shallow = nil
+    deep = schema(PropertiesController, :create)['properties']['property']['properties']
+    StandardMCP.config.input_schema_depth = 'shallow'
+    shallow = schema(PropertiesController, :create)['properties']['property']['properties']
+
+    assert_equal deep.keys, shallow.keys
+    assert_equal deep.except('photos'), shallow.except('photos')
+    assert_operator JSON.generate(deep).size, :>, JSON.generate(shallow).size
+  end
+
+  test "a nested belongs_to is an object or null, and its foreign key is taken even when the ACL doesn't list it" do
+    attributes = record(:create, SchemaInputWritesController, 'X-Nested' => 'true')['properties']
+
+    assert_equal ['integer', 'null'], attributes['account_id']['type']
+    assert_equal 'The account that owns this property.', attributes['account_id']['description']
+    assert_equal ['object', 'null'], attributes['account']['type']
+    assert_equal %w[id name status notes], attributes['account']['properties'].keys
+    refute attributes.key?('account_ids')
+  end
+
+  test "a cycle of nested associations ends in a loose object" do
+    items = schema(SchemaInputCycleController, :create).dig('properties', 'account', 'properties', 'properties', 'items')
+
+    assert_equal 'object', items['type']
+    # properties -> account again: the model is already on the path.
+    inner = items.dig('properties', 'account')
+    assert_equal ['object', 'null'], inner['type']
+    refute inner.key?('properties')
   end
 
   test "unknown actions are rejected" do
@@ -160,7 +532,7 @@ class SchemaInputTest < ActiveSupport::TestCase
       end
     end
 
-    %i[index show calculate].each { |action| walk.(schema(PropertiesController, action)) }
+    %i[index show create update destroy calculate].each { |action| walk.(schema(PropertiesController, action)) }
   end
 
   # --- where: descriptions

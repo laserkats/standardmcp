@@ -86,10 +86,30 @@ class DescriptionTest < ActiveSupport::TestCase
     assert_includes admin, 'Order by: id, name, size, created_at, rent.'
   end
 
-  test "writes are not implemented yet" do
-    %i[create update destroy].each do |action|
-      assert_raises(NotImplementedError) { describe(PropertiesController, action) }
-    end
+  test "create: names the required attributes" do
+    assert_equal 'Create one property. A real estate asset owned by an account. Required: name. ' \
+      "#{StandardMCP::Description::IGNORED} Includes: account, photos.", describe(PropertiesController, :create)
+    assert_includes describe(ContactsController, :create), 'Required: name.'
+  end
+
+  test "create leaves out the required sentence when nothing is required" do
+    refute_includes describe(AccountsController, :create), 'Required'
+  end
+
+  test "update: send only what changes" do
+    assert_equal 'Update one property by id. A real estate asset owned by an account. ' \
+      "Send only the attributes to change. #{StandardMCP::Description::IGNORED} Includes: account, photos.",
+      describe(PropertiesController, :update)
+  end
+
+  test "destroy: delete is permanent" do
+    assert_equal 'Delete one contact by id. A person to reach at an account. This is permanent.',
+      describe(ContactsController, :destroy)
+  end
+
+  test "write includes follow the caller" do
+    assert_includes describe(DescriptionVaryingController, :create), 'Includes: account.'
+    assert_includes describe(DescriptionVaryingController, :update, 'X-Admin' => 'true'), 'Includes: account, photos.'
   end
 
   test "unknown actions are rejected" do

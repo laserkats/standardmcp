@@ -52,6 +52,7 @@ Rails.application.routes.draw do
   standard_resources :accounts
   standard_resources :properties
   standard_resources :photos
+  standard_resources :contacts
 end
 
 # Test Application Helpers

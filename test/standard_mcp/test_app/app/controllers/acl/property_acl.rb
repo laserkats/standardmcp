@@ -1,7 +1,7 @@
 module PropertyACL
 
   def attributes
-    [ :account_id, :name, :size, :description ]
+    [ :account_id, :name, :kind, :size, :description, :available, :built_on, :rent ]
   end
 
   def orders

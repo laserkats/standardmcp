@@ -86,13 +86,18 @@ module StandardMCP
       end
     end
 
+    # Whether +call+ would let +action+ through, for work that must only
+    # happen once it is allowed (call still checks).
+    def allowed?(klass, action)
+      METHODS.key?(action.to_sym) && Registry.controller_for(klass, request).mcp_actions_allowed.include?(action.to_sym)
+    end
+
     private
 
     # The one authorization chokepoint. Conditions are per request, so this
     # re-checks even if tools/list advertised the tool.
     def ensure_allowed!(klass, action)
-      allowed = Registry.controller_for(klass, request).mcp_actions_allowed
-      return if METHODS.key?(action) && allowed.include?(action)
+      return if allowed?(klass, action)
 
       raise ActionNotAllowed, "#{action} is not allowed on #{klass.name}"
     end
@@ -104,10 +109,11 @@ module StandardMCP
       status, headers, rack_body = klass.action(action).call(env)
       Result.new(status: status, headers: headers.to_h, body: collect(rack_body))
     rescue StandardError => e
-      status = client_error_status(e) || (400 if filter_error(e))
+      kind = write_error(e, action)
+      status = client_error_status(e) || (WRITE_STATUSES.fetch(kind, 400) if kind) || (400 if filter_error(e))
       raise unless status
 
-      error_result(status, error_message(e, status))
+      error_result(status, error_message(e, status, action))
     end
 
     def build_env(klass, action, params, id)
@@ -192,11 +198,42 @@ module StandardMCP
       [PG::DataException, PG::SyntaxError, PG::UndefinedFunction, PG::UndefinedObject, PG::DatatypeMismatch].any? { |klass| cause.is_a?(klass) }
     end
 
+    WRITE_MESSAGES = {
+      reference: "A foreign key points at a record that doesn't exist",
+      referenced: "Other records still refer to this one, so it can't be deleted",
+      duplicate: 'A record with the same unique value already exists',
+      null: 'A required value is missing',
+      value: "A value is out of range, too long or otherwise doesn't fit its column"
+    }.freeze
+
+    # Conflicts with other records; the rest is a bad value (400).
+    WRITE_STATUSES = { referenced: 409, duplicate: 409 }.freeze
+
+    # :reference, :referenced, :duplicate, :null or :value for a write that the
+    # type cast or the database refused for the data in it (what a caller can
+    # fix), else nil. Validations catch most of these first; these are the
+    # constraints and limits only the database knows.
+    def write_error(error, action)
+      return unless %i[create update destroy].include?(action)
+
+      case error
+      when ActiveRecord::InvalidForeignKey then action == :destroy ? :referenced : :reference
+      when ActiveRecord::RecordNotUnique then :duplicate
+      when ActiveRecord::NotNullViolation then :null
+      when ActiveModel::RangeError, ActiveRecord::RangeError, ActiveRecord::ValueTooLong then :value
+      when ActiveRecord::StatementInvalid then :value if defined?(PG::DataException) && error.cause.is_a?(PG::DataException)
+      end
+    end
+
     # Exception messages can carry SQL or other internals (RecordNotFound
     # includes the scoped WHERE, which would leak a mask), so only the model
     # name for 404s, the missing parameter and a fixed sentence per kind of
-    # filter error are passed through.
-    def error_message(error, status)
+    # filter or write error are passed through.
+    def error_message(error, status, action)
+      if (kind = write_error(error, action))
+        return WRITE_MESSAGES.fetch(kind)
+      end
+
       if (kind = filter_error(error))
         return FILTER_MESSAGES.fetch(kind)
       end

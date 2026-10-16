@@ -5,6 +5,8 @@ module StandardMCP
   #
   # Nothing is memoized: comments change with migrations and dev reloads.
   module Description
+    IGNORED = "Attributes the record's rules don't allow are not saved and come back in ignored_attributes.".freeze
+
     class << self
       # +controller+ is an instance from Registry.controller_for.
       def for(controller, action)
@@ -21,8 +23,12 @@ module StandardMCP
         when :calculate
           ["Aggregate #{plural} (count, sum, min, max, average), optionally grouped.",
             'Filter with where; group with group_by.']
-        when :create, :update, :destroy
-          raise NotImplementedError, "Description for #{action} is not implemented"
+        when :create
+          ["Create one #{singular}.", create_guidance(controller)]
+        when :update
+          ["Update one #{singular} by id.", update_guidance(controller)]
+        when :destroy
+          ["Delete one #{singular} by id.", 'This is permanent.']
         else
           raise ArgumentError, "Unknown action #{action.inspect}. Valid actions: #{Controller::ACTIONS.map(&:inspect).join(', ')}"
         end
@@ -49,6 +55,19 @@ module StandardMCP
           names('Includes', Schema::Input.includes(controller)),
           names('Order by', order)
         ].compact.join(' ')
+      end
+
+      def create_guidance(controller)
+        required = Schema::Attributes.required(controller, controller.class.model)
+        [
+          ("Required: #{required.join(', ')}." if required.any?),
+          IGNORED,
+          names('Includes', Schema::Input.includes(controller))
+        ].compact.join(' ')
+      end
+
+      def update_guidance(controller)
+        ['Send only the attributes to change.', IGNORED, names('Includes', Schema::Input.includes(controller))].compact.join(' ')
       end
 
       # "Includes: a, b, b.c." for a tree or a list; nil when empty.

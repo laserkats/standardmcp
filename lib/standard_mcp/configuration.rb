@@ -26,7 +26,8 @@ module StandardMCP
     # model's own columns, 1 (the default) adds the columns of its permitted
     # includes, 2 theirs in turn, and so on. Always bounded by what the
     # controller's `model_includes` permits; `include` itself is not limited.
-    # Only used when `input_schema_depth` is 'deep'; the shallow `where` lists
+    # Only used when `input_schema_depth` is 'deep' (nested records of a write
+    # are typed to any depth, cycles aside); the shallow `where` lists
     # every permitted association and checks calls against the model instead.
     attr_accessor :where_depth
 
@@ -40,7 +41,9 @@ module StandardMCP
     #
     # 'deep': `where` is fully typed (a filter definition per column type,
     # inline enums, nested association columns bounded by `where_depth`) and the
-    # MCP server rejects a bad filter by schema validation.
+    # MCP server rejects a bad filter by schema validation. The nested records of
+    # create and update are typed from their own ACL too; shallow leaves them
+    # loose objects described in prose (the top-level attributes are typed either way).
     #
     # Accepts a String or Symbol.
     attr_reader :input_schema_depth

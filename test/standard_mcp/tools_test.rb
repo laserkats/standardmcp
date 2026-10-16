@@ -28,7 +28,7 @@ class ToolsTest < ActiveSupport::TestCase
   # Other test files opt in model-less controllers, which Tools.for rejects.
   setup do
     StandardMCP::Registry.stubs(:controllers).returns(
-      [Admin::AccountsController, AccountsController, PhotosController, PropertiesController]
+      [Admin::AccountsController, AccountsController, ContactsController, PhotosController, PropertiesController]
     )
     # Declared (and so validated against) unless a test says otherwise.
     StandardMCP.config.output_schema = true
@@ -100,12 +100,17 @@ class ToolsTest < ActiveSupport::TestCase
     ].sort, names.sort
   end
 
-  test "write tools and non-opted-in controllers are absent" do
-    names = list_tools('X-MCP-Writes' => 'true').map { |t| t[:name] }
+  test "write tools are hidden without the writes header, and non-opted-in controllers are absent" do
+    names = list_tools.map { |t| t[:name] }
 
     refute(names.any? { |n| n.match?(/create|update|delete|destroy/) })
     refute(names.any? { |n| n.include?('photo') })
     assert_includes names, 'list_properties'
+
+    # Photos never opted in, with or without writes.
+    writes = list_tools('X-MCP-Writes' => 'true').map { |t| t[:name] }
+    assert_includes writes, 'create_property'
+    refute(writes.any? { |n| n.include?('photo') })
   end
 
   test "titles and annotations" do

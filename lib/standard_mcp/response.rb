@@ -94,6 +94,7 @@ module StandardMCP
         when 401 then error('Unauthorized')
         when 403 then error(detail(json) ? "Forbidden: #{detail(json)}" : 'Forbidden')
         when 404 then error(detail(json) || 'Not found')
+        when 409 then error(detail(json) || 'Request failed with status 409')
         else error("Request failed with status #{status}")
         end
       end

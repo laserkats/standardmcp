@@ -14,11 +14,13 @@ module StandardMCP
   autoload :Dispatcher, 'standard_mcp/dispatcher'
   autoload :Response, 'standard_mcp/response'
   autoload :Description, 'standard_mcp/description'
+  autoload :IgnoredAttributes, 'standard_mcp/ignored_attributes'
   autoload :Tools, 'standard_mcp/tools'
   autoload :Endpoint, 'standard_mcp/endpoint'
   autoload :RouteHelpers, 'standard_mcp/route_helpers'
 
   module Schema
+    autoload :Attributes, 'standard_mcp/schema/attributes'
     autoload :Input, 'standard_mcp/schema/input'
     autoload :Output, 'standard_mcp/schema/output'
     autoload :Where, 'standard_mcp/schema/where'

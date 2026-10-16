@@ -69,10 +69,49 @@ class OutputSchemaTest < ActiveSupport::TestCase
     assert_valid schema, { result: { 'a' => 1 } }
   end
 
-  test "write actions are not implemented yet" do
-    %i[create update destroy].each do |action|
-      assert_raises(NotImplementedError) { schema_for(PropertiesController, action) }
+  test "create and update wrap the saved record, like show, and may report ignored attributes" do
+    %i[create update].each do |action|
+      schema = schema_for(PropertiesController, action)
+
+      assert_equal %w[record], schema['required']
+      assert_equal %w[record ignored_attributes], schema['properties'].keys
+      assert_equal record_schema(PropertiesController), schema.dig('properties', 'record')
+      assert_equal({ 'type' => 'array', 'items' => { 'type' => 'string' } },
+        schema.dig('properties', 'ignored_attributes').slice('type', 'items'))
+
+      assert_valid schema, { record: { id: 1, name: 'Tower' } }
+      assert_valid schema, { record: { id: 1 }, ignored_attributes: ['size'] }
+      refute_valid schema, { record: { id: 1 }, ignored_attributes: [1] }
+      refute_valid schema, { ignored_attributes: [] }
     end
+  end
+
+  test "destroy reports success and, when sent, the affected rows" do
+    schema = schema_for(ContactsController, :destroy)
+
+    assert_equal %w[success], schema['required']
+    assert_equal 'boolean', schema.dig('properties', 'success', 'type')
+    assert_equal 'integer', schema.dig('properties', 'affected_rows', 'type')
+
+    assert_valid schema, { success: true, affected_rows: 1 }
+    assert_valid schema, { success: true }
+    refute_valid schema, { success: 'yes' }
+    refute_valid schema, { affected_rows: 1 }
+  end
+
+  test "real write results validate" do
+    account = create(:account)
+    headers = { 'X-MCP-Writes' => 'true', 'Authorization' => "Bearer #{account.id}" }
+
+    created = structured(ContactsController, :create, { 'contact' => { 'name' => 'Pat', 'account_id' => account.id } }, headers: headers)
+    assert_valid schema_for(ContactsController, :create), created
+
+    updated = structured(ContactsController, :update, { 'id' => created[:record]['id'], 'contact' => { 'name' => 'Sam' } }, headers: headers)
+    assert_valid schema_for(ContactsController, :update), updated
+
+    destroyed = structured(ContactsController, :destroy, { 'id' => created[:record]['id'] }, headers: headers)
+    assert_equal({ success: true, affected_rows: 1 }, destroyed)
+    assert_valid schema_for(ContactsController, :destroy), destroyed
   end
 
   test "unknown actions raise" do
@@ -80,7 +119,7 @@ class OutputSchemaTest < ActiveSupport::TestCase
   end
 
   test "the schema is accepted by mcp" do
-    %i[index show calculate].each do |action|
+    %i[index show create update destroy calculate].each do |action|
       output = MCP::Tool::OutputSchema.new(schema_for(PropertiesController, action))
       assert_equal 'object', output.to_h[:type]
     end

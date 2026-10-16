@@ -1,7 +1,8 @@
 module StandardMCP
   # Builds the MCP tools for one request: one MCP::Tool per allowed
   # (controller, action), named from the controller path (index
-  # `list_accounts`, show `get_account`, calculate `calculate_accounts`).
+  # `list_accounts`, show `get_account`, create `create_account`, update
+  # `update_account`, destroy `delete_account`, calculate `calculate_accounts`).
   #
   # Tools are built per request because the ACL-derived schemas and `if:`
   # conditions depend on the caller. Each tool closes over that request and
@@ -21,19 +22,35 @@ module StandardMCP
   # (Schema::Where.errors) and a problem comes back as an `isError` result.
   # With `input_schema_depth = 'deep'` the schema rejects bad filters itself.
   module Tools
-    # Write actions come in a later step; they are skipped silently until then.
-    ACTIONS = %i[index show calculate].freeze
+    ACTIONS = %i[index show create update destroy calculate].freeze
 
-    VERBS = { index: 'list', show: 'get', calculate: 'calculate' }.freeze
+    VERBS = {
+      index: 'list', show: 'get', create: 'create', update: 'update', destroy: 'delete', calculate: 'calculate'
+    }.freeze
+
+    # Actions on one record, named for its singular (`get_account`).
+    SINGULAR = %i[show create update destroy].freeze
 
     # MCP spec: 1-64 characters. (The mcp gem allows 128.)
     MAX_NAME_LENGTH = 64
 
-    ANNOTATIONS = {
+    READ_ONLY = {
       read_only_hint: true,
       destructive_hint: false,
       idempotent_hint: true,
       open_world_hint: false
+    }.freeze
+
+    # Update overwrites and delete removes, so both are destructive; repeating
+    # either leaves the same state (a repeated delete finds nothing). A create
+    # makes a new record each time.
+    ANNOTATIONS = {
+      index: READ_ONLY,
+      show: READ_ONLY,
+      calculate: READ_ONLY,
+      create: { read_only_hint: false, destructive_hint: false, idempotent_hint: false, open_world_hint: false },
+      update: { read_only_hint: false, destructive_hint: true, idempotent_hint: true, open_world_hint: false },
+      destroy: { read_only_hint: false, destructive_hint: true, idempotent_hint: true, open_world_hint: false }
     }.freeze
 
     class << self
@@ -64,7 +81,7 @@ module StandardMCP
 
       def tool_name(klass, action)
         segments = klass.controller_path.split('/')
-        segments[-1] = segments[-1].singularize if action == :show
+        segments[-1] = segments[-1].singularize if SINGULAR.include?(action)
         name = "#{VERBS.fetch(action)}_#{segments.join('_')}"
         return name if name.length <= MAX_NAME_LENGTH
 
@@ -84,6 +101,11 @@ module StandardMCP
           args = { 'limit' => limit, 'offset' => 0 }.compact.merge(args)
           result = dispatcher.call(klass, :index, args)
           Response.from(result, action: :index, extra: pagination(dispatcher, klass, args, result, countable))
+        elsif action == :create || action == :update
+          # Worked out before the write, while an update's record is as it was.
+          ignored = ignored_attributes(request, dispatcher, klass, action, args)
+          result = dispatcher.call(klass, action, args)
+          Response.from(result, action: action, extra: ({ ignored_attributes: ignored } if ignored.any?))
         else
           Response.from(dispatcher.call(klass, action, args), action: action)
         end
@@ -97,7 +119,7 @@ module StandardMCP
         input = Schema::Input.for(controller, action)
         limit = input.dig('properties', 'limit', 'default')
         words = klass.controller_path.tr('/', ' ').humanize
-        words = words.singularize if action == :show
+        words = words.singularize if SINGULAR.include?(action)
 
         MCP::Tool.define(
           name: tool_name(klass, action),
@@ -105,10 +127,35 @@ module StandardMCP
           description: Description.for(controller, action),
           input_schema: input,
           output_schema: (Schema::Output.for(controller, action) if StandardMCP.config.output_schema),
-          annotations: ANNOTATIONS
+          annotations: ANNOTATIONS.fetch(action)
         ) do |server_context: nil, **args|
           Tools.run(request, klass, action, args, limit: limit, countable: countable)
         end
+      end
+
+      # The submitted attributes StandardAPI will drop (IgnoredAttributes). An
+      # update asks the ACL about the record as StandardAPI will find it, with
+      # the controller's own `resources`, so `mask_for` applies and a record
+      # the caller can't see is no different from a missing one (nothing is
+      # reported; the update answers not found). If the lookup fails otherwise
+      # the nil-record list stands in. Only once the action is allowed.
+      def ignored_attributes(request, dispatcher, klass, action, args)
+        return [] unless dispatcher.allowed?(klass, action)
+
+        model = klass.model
+        submitted = args[model.model_name.singular]
+        return [] unless submitted.is_a?(Hash) && submitted.any?
+
+        controller = Registry.controller_for(klass, request)
+        record = begin
+          action == :create ? model.new : controller.send(:resources).find(args['id'])
+        rescue ActiveRecord::RecordNotFound
+          return []
+        rescue StandardError
+          nil
+        end
+
+        IgnoredAttributes.for(controller, model, record, submitted)
       end
 
       # Problems with the call's `where` that the input schema didn't catch.

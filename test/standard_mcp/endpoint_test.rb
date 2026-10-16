@@ -21,7 +21,7 @@ class EndpointTest < ActionDispatch::IntegrationTest
 
   setup do
     StandardMCP::Registry.stubs(:controllers).returns(
-      [Staff::AccountsController, AccountsController, PropertiesController]
+      [Staff::AccountsController, AccountsController, ContactsController, PropertiesController]
     )
     StandardMCP.config.server_name = 'endpoint-test'
     StandardMCP.config.server_version = '9.9.9'
@@ -170,6 +170,64 @@ class EndpointTest < ActionDispatch::IntegrationTest
 
     assert_equal [3], call_tool('calculate_accounts', { select: [{ count: '*' }] })['structuredContent']['result']
     assert_equal [1], call_tool('calculate_accounts', { select: [{ count: '*' }] }, headers: bearer(mine.id))['structuredContent']['result']
+  end
+
+  test "tools/list shows the write tools only with the writes header" do
+    assert_equal %w[create_contact create_property delete_contact update_contact update_property],
+      tool_names(headers: { 'X-MCP-Writes' => 'true' }).grep(/create|update|delete/).sort
+    assert_empty tool_names.grep(/create|update|delete/)
+  end
+
+  test "create saves a record, through a bearer that passes CSRF" do
+    account = create(:account)
+
+    created = call_tool('create_contact', { contact: { name: 'Pat', account_id: account.id } },
+      headers: bearer(account.id).merge('X-MCP-Writes' => 'true'))
+
+    refute created['isError']
+    assert_equal 'Pat', created['structuredContent']['record']['name']
+    assert_equal 'member', created['structuredContent']['record']['role']
+    assert_equal account.id, Contact.find(created['structuredContent']['record']['id']).account_id
+  end
+
+  test "create with a validation problem is a tool error over HTTP" do
+    account = create(:account)
+
+    result = call_tool('create_property', { property: { name: '' } }, headers: bearer(account.id).merge('X-MCP-Writes' => 'true'))
+
+    assert result['isError']
+    assert_equal "name can't be blank", result['structuredContent']['error']
+    assert_equal 0, Property.count
+  end
+
+  test "delete removes a record and reports the rows, and a masked one is not found" do
+    mine = create(:account)
+    contact = create(:contact, account: mine)
+    other = create(:contact)
+    headers = bearer(mine.id).merge('X-MCP-Writes' => 'true')
+
+    missing = call_tool('delete_contact', { id: other.id }, headers: headers)
+    assert missing['isError']
+    assert_equal 'Contact not found', missing['structuredContent']['error']
+    assert Contact.exists?(other.id)
+
+    deleted = call_tool('delete_contact', { id: contact.id }, headers: headers)
+    refute deleted['isError']
+    assert_equal({ 'success' => true, 'affected_rows' => 1 }, deleted['structuredContent'])
+    refute Contact.exists?(contact.id)
+  end
+
+  test "a write without a bearer is refused by CSRF protection and reported as a tool error" do
+    result = call_tool('create_contact', { contact: { name: 'Pat' } }, headers: { 'X-MCP-Writes' => 'true' })
+
+    assert result['isError']
+    assert_equal 0, Contact.count
+  end
+
+  test "a hidden write tool cannot be called" do
+    rpc('tools/call', { name: 'delete_contact', arguments: { id: 1 } }, headers: bearer(1))
+
+    assert_equal(-32602, error['code'])
   end
 
   test "invalid arguments are a tool error" do

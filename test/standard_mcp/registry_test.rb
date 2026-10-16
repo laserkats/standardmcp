@@ -39,12 +39,14 @@ class RegistryTest< ActiveSupport::TestCase
     assert_equal [:index, :show, :calculate], allowed[AccountsController]
     assert_equal [:index, :show], allowed[PropertiesController]
     refute allowed.key?(PhotosController)
+    refute allowed.key?(ContactsController)
   end
 
   test "allowed exposes conditional actions when the condition passes" do
     allowed = StandardMCP::Registry.allowed(request_for('X-MCP-Writes' => 'true'))
     assert_equal [:index, :show, :create, :update, :calculate], allowed[PropertiesController]
     assert_equal [:index, :show, :calculate], allowed[AccountsController]
+    assert_equal [:create, :update, :destroy], allowed[ContactsController]
   end
 
   test "allowed omits controllers with nothing allowed" do

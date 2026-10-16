@@ -49,6 +49,63 @@ standard_mcp "/mcp"
 - Row-level restriction is not handled here; use StandardAPI's `mask_for`.
 - Table and column comments (Postgres) become tool and parameter descriptions.
 
+## Tools
+
+One tool per allowed (controller, action). Controller paths become names
+(`admin/accounts` is `list_admin_accounts` and `get_admin_account`).
+
+| Action      | Tool                | Arguments                                         |
+| ----------- | ------------------- | ------------------------------------------------- |
+| `index`     | `list_accounts`     | `where`, `order`, `include`, `limit`, `offset`, `distinct` |
+| `show`      | `get_account`       | `id`, `include`                                   |
+| `calculate` | `calculate_accounts`| `where`, `select`, `group_by`                     |
+| `create`    | `create_account`    | `account` (required), `include`                   |
+| `update`    | `update_account`    | `id`, `account` (both required), `include`        |
+| `destroy`   | `delete_account`    | `id`                                              |
+
+Annotations: reads are read-only and idempotent; create is neither destructive
+nor idempotent; update and delete are destructive and idempotent.
+
+### Writes
+
+The record goes under its singular name, as StandardAPI's `params.require`
+wants it: `{"property": {"name": "Tower"}, "include": {"photos": true}}`. The
+attributes are the ACL's `attributes` list, typed from the columns with the
+column comments as descriptions, and the tool rejects anything else.
+
+- `required` on create: a permitted NOT NULL column or presence-validated
+  attribute that has no default. An update needs at least one attribute and
+  none in particular.
+- Validators become keywords where that is safe for input: enums (AR enums and
+  unconditional `inclusion`), `length`, `numericality` bounds and `format`
+  (only when the Ruby regexp means the same in ECMA 262, else the description
+  says "Must match /.../"). Validators with `if:`, `unless:` or a non-matching
+  `on:` are left to Rails, whose errors come back as tool errors with `errors`.
+  `null` is offered only for nullable columns. Ids, timestamps, database-filled
+  and (on update) `attr_readonly` columns, and columns an ACL `excludes` hides,
+  are not accepted.
+- Nested attributes (an ACL `nested` list) are accepted as StandardAPI does:
+  the association as an object (or an array of objects), each with an optional
+  `id` to update an existing record, `<association>_ids`, and the foreign key
+  of a `belongs_to`. A nested collection replaces the whole set. With
+  `input_schema_depth = 'deep'` they are typed from the nested model's own ACL;
+  by default (`'shallow'`) the association is a loose object and its
+  description lists the permitted attributes (`name (type): comment`), while
+  the top-level attributes stay typed. StandardAPI and ActiveRecord check the
+  nested values then, and their problems come back as tool errors.
+- The ACL is asked for the schema without a record (`attributes(nil)`). A
+  per-record `attributes(record)` can therefore still drop a key the schema
+  accepted. StandardAPI drops such keys silently, so the result reports them as
+  `ignored_attributes` (`["size", "photos.internal_path"]`) when there are
+  any. For an update they are worked out from the record as StandardAPI finds
+  it (through the controller's own `resources`, so `mask_for` applies); a
+  create asks about a new record, nested records are always judged as new ones
+  and a lookup that fails falls back to the nil-record list.
+- A masked or missing id is `"Property not found"` for update and delete,
+  whatever the mask. Delete returns `{"success": true, "affected_rows": 1}`.
+  Constraints only the database knows (foreign key, NOT NULL, unique, out of
+  range) are tool errors in plain words, without SQL.
+
 ## Mounting the endpoint
 
 ```ruby
@@ -90,10 +147,10 @@ caller's credentials (Authorization, Cookie, remote address, host), so
 
 - CSRF: the endpoint skips forgery protection, which is safe because the
   transport only accepts `Content-Type: application/json`, which a cross-site
-  form or no-preflight request can't send. The in-process calls themselves are
-  reads, but they run your `protect_from_forgery` like any request, so later
-  write tools need bearer-style authentication or a `verified_request?` that
-  honors a key set through `dispatch_env`.
+  form or no-preflight request can't send. The in-process calls themselves run
+  your `protect_from_forgery` like any request, so write tools need
+  bearer-style authentication or a `verified_request?` that honors a key set
+  through `dispatch_env`; otherwise a write comes back as a tool error.
 - Origin: a request with an `Origin` header must be same-origin or match
   `config.allowed_origins`, else 403. Requests without one (non-browser
   clients) pass.
@@ -129,9 +186,10 @@ end
 
 - `input_schema_depth`: `'shallow'` leaves `where` a bare object and lists the
   filterable columns in the tool description (a fraction of the tokens; calls are
-  checked against the model before they run). `'deep'` spells out `where` in the
-  schema, nested associations up to `where_depth`, and the server rejects bad
-  filters by schema validation.
+  checked against the model before they run), and likewise leaves the nested
+  records of a write loose. `'deep'` spells out `where` in the schema, nested
+  associations up to `where_depth`, and the nested records of a write, and the
+  server rejects bad filters and nested values by schema validation.
 - `output_schema`: declare an `outputSchema` per tool (about a quarter more
   `tools/list`). `structuredContent` is returned either way.
 - `validate_results`: check results against the output schema; only has an

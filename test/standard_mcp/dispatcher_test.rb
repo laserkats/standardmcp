@@ -267,6 +267,70 @@ class DispatcherTest < ActiveSupport::TestCase
     assert_equal 201, result.status
   end
 
+  test "destroy returns 204 and the affected rows" do
+    contact = create(:contact)
+
+    result = dispatch(ContactsController, :destroy, { 'id' => contact.id }, writes(contact.account_id))
+
+    assert_equal 204, result.status
+    assert_equal '1', result.headers.find { |key, _| key.casecmp?('Affected-Rows') }&.last.to_s
+    refute Contact.exists?(contact.id)
+  end
+
+  test "destroy of a masked record is a 404 that names only the model" do
+    mine = create(:account)
+    other = create(:contact)
+
+    result = dispatch(ContactsController, :destroy, { 'id' => other.id }, writes(mine.id))
+
+    assert_equal 404, result.status
+    assert_equal({ 'error' => 'Contact not found' }, result.json)
+    assert Contact.exists?(other.id)
+  end
+
+  test "constraints only the database knows are 4xx results, in plain words" do
+    {
+      ActiveRecord::NotNullViolation => [400, 'A required value is missing'],
+      ActiveRecord::RecordNotUnique => [409, 'A record with the same unique value already exists'],
+      ActiveRecord::InvalidForeignKey => [400, "A foreign key points at a record that doesn't exist"],
+      ActiveRecord::ValueTooLong => [400, "A value is out of range, too long or otherwise doesn't fit its column"],
+      ActiveModel::RangeError => [400, "A value is out of range, too long or otherwise doesn't fit its column"]
+    }.each do |error, (status, message)|
+      ContactsController.any_instance.stubs(:create).raises(error, 'INSERT INTO "contacts" secret')
+
+      result = dispatch(ContactsController, :create, { 'contact' => { 'name' => 'x' } }, writes)
+
+      assert_equal status, result.status, error.name
+      assert_equal({ 'error' => message }, result.json, error.name)
+    end
+  end
+
+  test "a foreign key that blocks a destroy says so" do
+    ContactsController.any_instance.stubs(:destroy).raises(ActiveRecord::InvalidForeignKey, 'secret')
+
+    result = dispatch(ContactsController, :destroy, { 'id' => 1 }, writes)
+
+    assert_equal 409, result.status
+    assert_equal({ 'error' => "Other records still refer to this one, so it can't be deleted" }, result.json)
+  end
+
+  test "database errors on a read are still server errors" do
+    AccountsController.any_instance.stubs(:index).raises(ActiveRecord::NotNullViolation, 'secret')
+
+    assert_raises(ActiveRecord::NotNullViolation) { dispatch(AccountsController, :index, { 'limit' => 1 }) }
+  end
+
+  test "allowed? says whether call would let the action through" do
+    dispatcher = StandardMCP::Dispatcher.new(request_for(writes))
+
+    assert dispatcher.allowed?(ContactsController, :destroy)
+    assert dispatcher.allowed?(ContactsController, 'create')
+    refute dispatcher.allowed?(ContactsController, :index)
+    refute dispatcher.allowed?(PropertiesController, :destroy)
+    refute dispatcher.allowed?(ContactsController, :json_schema)
+    refute StandardMCP::Dispatcher.new(request_for).allowed?(ContactsController, :create)
+  end
+
   # --- StandardAPI error responses
 
   test "missing limit is a 400 with StandardAPI's message" do

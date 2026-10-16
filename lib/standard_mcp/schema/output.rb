@@ -30,8 +30,8 @@ module StandardMCP
         when :index then index(record(controller))
         when :show then show(record(controller))
         when :calculate then calculate
-        when :create, :update, :destroy
-          raise NotImplementedError, "Output schema for #{action} is not implemented"
+        when :create, :update then written(record(controller))
+        when :destroy then destroyed
         else
           raise ArgumentError, "Unknown action #{action.inspect}. Valid actions: #{Controller::ACTIONS.map(&:inspect).join(', ')}"
         end
@@ -64,6 +64,30 @@ module StandardMCP
           'type' => 'object',
           'properties' => { 'record' => record },
           'required' => %w[record]
+        }
+      end
+
+      # The saved record, plus the keys of the submitted attributes the ACL
+      # dropped (only present when there were some).
+      def written(record)
+        schema = show(record)
+        schema['properties']['ignored_attributes'] = {
+          'type' => 'array',
+          'items' => { 'type' => 'string' },
+          'description' => 'Submitted attributes that were not saved because the caller may not set them.'
+        }
+        schema
+      end
+
+      # `affected_rows` is left out when StandardAPI sends no Affected-Rows header.
+      def destroyed
+        {
+          'type' => 'object',
+          'properties' => {
+            'success' => { 'type' => 'boolean' },
+            'affected_rows' => { 'type' => 'integer', 'description' => 'Number of records deleted.' }
+          },
+          'required' => %w[success]
         }
       end
 

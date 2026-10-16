@@ -9,7 +9,7 @@ module StandardMCP
     # Schemas are built per call and never memoized: they depend on the
     # caller, and on the database, which can change under a dev reload.
     module Input
-      ACTIONS = %i[index show calculate].freeze
+      ACTIONS = %i[index show create update destroy calculate].freeze
 
       # Keys StandardAPI accepts next to association names inside an include
       # tree; they scope the query rather than name a relation.
@@ -48,8 +48,8 @@ module StandardMCP
           when :index then index(controller)
           when :show then show(controller)
           when :calculate then calculate(controller)
-          when :create, :update, :destroy
-            raise NotImplementedError, "Input schema for #{action} is not implemented"
+          when :create, :update then write(controller, action)
+          when :destroy then destroy(controller)
           else
             raise ArgumentError, "Unknown action #{action.inspect}. Valid actions: #{ACTIONS.map(&:inspect).join(', ')}"
           end
@@ -141,6 +141,25 @@ module StandardMCP
               'items' => { 'maxProperties' => 1 }
             } } }
           )
+        end
+
+        # The record goes under its singular name, which is the key StandardAPI
+        # requires (`params.require(:property)`); an update also names the
+        # record to change.
+        def write(controller, action)
+          model = controller.class.model
+          tree = includes(controller)
+          key = model.model_name.singular
+          properties = {}
+          properties['id'] = id_schema(model) if action == :update
+          properties[key] = Attributes.schema(controller, model, action)
+          properties['include'] = include_schema(model, tree) if tree.any?
+
+          root(properties, action == :update ? ['id', key] : [key])
+        end
+
+        def destroy(controller)
+          root({ 'id' => id_schema(controller.class.model, one: true) }, ['id'])
         end
 
         def root(properties, required, defs = {})
@@ -369,7 +388,12 @@ module StandardMCP
         end
 
         def fallback_type(column)
-          case column.type
+          scalar_schema(column.type)
+        end
+
+        # The JSON type of an ActiveRecord type (a symbol such as :integer).
+        def scalar_schema(type)
+          case type
           when :integer, :bigint then { type: 'integer' }
           when :float, :decimal then { type: 'number' }
           when :boolean then { type: 'boolean' }
@@ -387,7 +411,7 @@ module StandardMCP
 
           model.validators_on(column.name.to_sym).each do |validator|
             next unless validator.is_a?(ActiveModel::Validations::InclusionValidator)
-            next if validator.options[:if] || validator.options[:unless]
+            next if validator.options[:if] || validator.options[:unless] || validator.options[:on]
 
             values = validator.options[:in] || validator.options[:within]
             return values.as_json if values.is_a?(Array)
@@ -515,9 +539,12 @@ module StandardMCP
           schema
         end
 
-        def id_schema(model)
+        # +one+ for destroy, which StandardAPI also takes a comma-separated list
+        # of ids for; a string id must not be able to name several records.
+        def id_schema(model, one: false)
           column = model.columns_hash[model.primary_key] if model.primary_key.is_a?(String)
           type = column ? value_schema(column).slice('type', 'format') : { 'type' => 'string' }
+          type['pattern'] = '^[^,]+$' if one && type['type'] == 'string'
           type.merge('description' => "ID of the #{model.model_name.human.downcase}")
         end
 
@@ -563,8 +590,9 @@ module StandardMCP
         end
 
         # Shared with Schema::Where, which describes and checks filters with the
-        # same tables.
-        public :column_kind, :column_operators, :allowed_values, :klass_for, :association_description
+        # same tables, and Schema::Attributes, which types the written record.
+        public :column_kind, :column_operators, :allowed_values, :klass_for, :association_description,
+          :value_schema, :scalar_schema, :nullable, :id_schema
       end
     end
   end

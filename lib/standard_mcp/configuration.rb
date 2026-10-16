@@ -69,6 +69,7 @@ module StandardMCP
     # clients) and same-origin ones, which refuses a cross-site page driving the
     # endpoint with the caller's cookies. An Array of Strings (exact,
     # case-insensitive, e.g. 'https://claude.ai') and/or Regexps widens that.
+    # Regexps must match the whole origin; they are anchored for you.
     # Anything else is answered with 403.
     attr_accessor :allowed_origins
 

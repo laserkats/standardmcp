@@ -380,6 +380,19 @@ class EndpointTest < ActionDispatch::IntegrationTest
     assert_response :forbidden
   end
 
+  test "allowed_origins patterns must match the whole origin" do
+    StandardMCP.config.allowed_origins = [/https:\/\/[a-z]+\.example\.org/i]
+
+    rpc('tools/list', headers: { 'Origin' => 'https://App.example.org' })
+    assert_response :success
+
+    rpc('tools/list', headers: { 'Origin' => 'https://app.example.org.evil.example' })
+    assert_response :forbidden
+
+    rpc('tools/list', headers: { 'Origin' => 'http://evil.example/https://app.example.org' })
+    assert_response :forbidden
+  end
+
   test "a refused origin is answered before the parent authenticates" do
     StandardMCP.config.parent_controller = 'BearerRequiredController'
     StandardMCP.define_server_controller!

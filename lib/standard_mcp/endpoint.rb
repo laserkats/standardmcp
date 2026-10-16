@@ -158,8 +158,14 @@ module StandardMCP
       return true if origin.casecmp?(request.base_url)
 
       Array(StandardMCP.config.allowed_origins).any? do |allowed|
-        allowed.is_a?(Regexp) ? allowed.match?(origin) : allowed.to_s.casecmp?(origin)
+        allowed.is_a?(Regexp) ? mcp_anchored(allowed).match?(origin) : allowed.to_s.casecmp?(origin)
       end
+    end
+
+    # A pattern must match the whole origin: unanchored, /jll\.com/ would also
+    # accept https://jll.com.evil.example.
+    def mcp_anchored(pattern)
+      Regexp.new("\\A(?:#{pattern.source})\\z", pattern.options)
     end
 
     def render_mcp_parse_error

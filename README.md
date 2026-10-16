@@ -139,7 +139,9 @@ end
 - `default_limit`: page size for `index` when neither the controller nor the
   caller sets one.
 - `allowed_origins`: Strings (exact) and/or Regexps accepted besides the
-  endpoint's own origin; nil accepts only that.
+  endpoint's own origin; nil accepts only that. Regexps are anchored to the
+  whole origin, so `/https:\/\/[a-z]+\.example\.com/` won't accept
+  `https://app.example.com.evil.example`.
 - `exception_reporter`: called with unexpected errors; nil keeps the mcp gem's.
 
 Argument validation against the tool's input schema is always on.

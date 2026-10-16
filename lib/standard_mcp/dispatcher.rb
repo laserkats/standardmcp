@@ -165,6 +165,10 @@ module StandardMCP
     # action(...).call skips ShowExceptions, so exceptions that Rails would
     # render as a 4xx surface here instead. 5xx (and unmapped) ones re-raise.
     def client_error_status(error)
+      # Not mapped by Rails (RecordNotSaved is), though it is the same thing:
+      # a callback refused the change.
+      return 422 if error.is_a?(ActiveRecord::RecordNotDestroyed)
+
       status = ActionDispatch::ExceptionWrapper.status_code_for_exception(error.class.name)
       status if (400..499).cover?(status)
     end
@@ -227,8 +231,9 @@ module StandardMCP
 
     # Exception messages can carry SQL or other internals (RecordNotFound
     # includes the scoped WHERE, which would leak a mask), so only the model
-    # name for 404s, the missing parameter and a fixed sentence per kind of
-    # filter or write error are passed through.
+    # name for 404s, the missing parameter, a fixed sentence per kind of
+    # filter or write error and the model's own errors for a write a callback
+    # refused are passed through.
     def error_message(error, status, action)
       if (kind = write_error(error, action))
         return WRITE_MESSAGES.fetch(kind)
@@ -239,6 +244,8 @@ module StandardMCP
       end
 
       case error
+      when ActiveRecord::RecordNotDestroyed, ActiveRecord::RecordNotSaved
+        refused_message(error, action)
       when ActiveRecord::RecordNotFound
         error.model ? "#{error.model} not found" : 'Not found'
       when ActionController::ParameterMissing
@@ -246,6 +253,18 @@ module StandardMCP
       else
         Rack::Utils::HTTP_STATUS_CODES.fetch(status, 'Bad request')
       end
+    end
+
+    # A callback halted the write (`throw :abort`). The reasons are the ones
+    # the model added to its own errors, in words the app chose; database
+    # errors never land there (they raise StatementInvalid and are mapped
+    # above), so unlike an exception message this is safe to pass on.
+    def refused_message(error, action)
+      record = error.record
+      verb = action == :destroy ? 'deleted' : 'saved'
+      message = "#{record ? record.class.name : 'Record'} could not be #{verb}"
+      reasons = record ? record.errors.full_messages : []
+      reasons.any? ? "#{message}: #{reasons.join(', ')}" : message
     end
 
     def error_result(status, message)

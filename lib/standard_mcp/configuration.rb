@@ -9,9 +9,21 @@ module StandardMCP
     # Controller class (name) the generated MCP endpoint inherits from.
     attr_accessor :parent_controller
 
-    # nil, a String, or a callable (`->(request) { "..." }`) producing the
-    # server instructions sent to clients.
+    # The server instructions sent to clients (see StandardMCP::Instructions).
+    # nil (the default) sends the generated ones: the database comment, the
+    # resources with their table comments and tools, and the shared conventions.
+    #
+    # - a String, or a callable taking the request (`->(request) { "..." }`),
+    #   replaces them entirely;
+    # - a callable taking the request and the generated text
+    #   (`->(request, default) { "#{default}\n\n..." }`) adds to them;
+    # - false sends none.
+    #
+    # A callable that returns nothing falls back to the generated ones.
     attr_accessor :instructions
+
+    # Columns `rake standard_mcp:lint` doesn't expect a comment on.
+    attr_accessor :lint_ignore_columns
 
     # Callable `->(request) { {} }` returning extra Rack env entries merged into
     # the in-process request dispatched to a StandardAPI controller action.
@@ -81,6 +93,7 @@ module StandardMCP
       @server_version = nil
       @parent_controller = "ApplicationController"
       @instructions = nil
+      @lint_ignore_columns = %w[id created_at updated_at]
       @dispatch_env = ->(request) { {} }
       @default_limit = 25
       @where_depth = 1

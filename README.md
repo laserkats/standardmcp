@@ -104,7 +104,139 @@ column comments as descriptions, and the tool rejects anything else.
 - A masked or missing id is `"Property not found"` for update and delete,
   whatever the mask. Delete returns `{"success": true, "affected_rows": 1}`.
   Constraints only the database knows (foreign key, NOT NULL, unique, out of
-  range) are tool errors in plain words, without SQL.
+  range) are tool errors in plain words, without SQL. A write a model callback
+  refuses (`throw :abort`) says why in the model's own errors:
+  `"Contact could not be deleted: Locked contacts cannot be deleted"` (just
+  `"Contact could not be deleted"` when it added none).
+
+## Context from comments
+
+The gem takes the application's context from database comments (Postgres), so
+the documentation lives with the schema and can't drift from it:
+
+| Comment            | Becomes                                                                 |
+| ------------------ | ----------------------------------------------------------------------- |
+| database           | the opening paragraph of the server instructions                        |
+| table              | the tool descriptions, and the table's line in the instructions         |
+| column             | the description of the column in `where`, in write inputs and nested records |
+| foreign key column | the description of its association (else the associated table's comment) |
+
+Write them in migrations:
+
+```ruby
+create_table :accounts, comment: 'A customer organization that owns properties.' do |t|
+  t.string :name, comment: 'Display name of the organization.'
+end
+
+add_column :accounts, :status, :string, comment: 'Lifecycle status: active or suspended.'
+change_table_comment :accounts, from: nil, to: 'A customer organization.'
+change_column_comment :accounts, :notes, from: nil, to: 'Free-form notes from sales.'
+```
+
+The database comment is set with `COMMENT ON DATABASE app IS '...'` (StandardAPI
+reads it back as `connection.database_comment`).
+
+Say what a value means rather than what its column is called: the lifecycle
+behind a `status`, the unit of a `size`, how a hierarchy is stored. `rake
+standard_mcp:lint` lists what is still missing.
+
+### Server instructions
+
+The instructions sent when a client connects are generated from those comments,
+for the request at hand (what `allow_mcp` hides from the caller is left out):
+
+```
+Property management data: customer accounts, the properties they own and the people to reach.
+
+Resources:
+accounts: A customer organization that owns properties. Tools: list_accounts, get_account, calculate_accounts.
+properties: A real estate asset owned by an account. Tools: list_properties, get_property.
+
+Conventions: list_* tools return one page; pass the result's next_offset as offset to get the next. Filters (where) take operator objects such as {"size": {"gte": 1000}}; a tool's where description lists its columns and operators. include embeds associations in the result.
+```
+
+A model without a table comment is still listed, with its tools. The operators
+and columns stay in each tool's `where` description, so every tool is
+self-contained and the instructions stay short.
+
+`config.instructions` changes them:
+
+```ruby
+# Add domain context to the generated text (a callable taking two arguments):
+config.instructions = ->(request, default) do
+  "#{default}\n\nSizes are in square feet. A TIM is a tenant improvement allowance."
+end
+
+# Replace it (a String, or a callable taking the request):
+config.instructions = 'Use these tools carefully.'
+config.instructions = ->(request) { "Hello #{request.headers['X-Who']}" }
+
+# Send none:
+config.instructions = false
+```
+
+A callable that returns nothing falls back to the generated text. The text is
+only worked out for `initialize` (and `server/discover`), not for every call.
+
+## Checking the result
+
+Both tasks run in the host app (`bundle exec rake ...`).
+
+### `rake standard_mcp:lint`
+
+Lists the tables and columns exposed through MCP tools that have no comment:
+every MCP-enabled controller's model, and the models reachable through its
+permitted includes and nested attributes. A column counts when the ACL's
+`excludes` doesn't hide it; `id`, `created_at` and `updated_at` are skipped
+(`config.lint_ignore_columns`, or `IGNORE_COLUMNS=id,created_at` for one run).
+
+```
+$ bundle exec rake standard_mcp:lint
+StandardMCP comment lint
+ACLs are evaluated for an anonymous request; per-request ACLs may expose more to some callers.
+Ignored columns: id, created_at, updated_at
+
+accounts (Account)
+  notes has no comment
+photos (Photo)
+  caption has no comment
+
+Summary: 2 missing comments (2 columns) across 4 tables checked
+```
+
+The exit status is 0 unless `STRICT=1` is set and something is missing, which
+makes it usable in CI (`STRICT=1 bundle exec rake standard_mcp:lint`). A missing
+database comment is reported too; `DATABASE_COMMENT=0` skips that. The logic is
+`StandardMCP::Lint.run(io: $stdout, strict: false)`, which returns the findings.
+
+ACL methods need a request, so they are evaluated for an anonymous one. A
+controller whose `attributes`, `includes` or `excludes` depend on the caller may
+expose more to some callers than is checked here.
+
+### `rake standard_mcp:tools`
+
+Prints the server instructions and `tools/list` a caller would get, without a
+client:
+
+```
+$ HEADERS='X-MCP-Writes: true' FORMAT=summary bundle exec rake standard_mcp:tools
+list_accounts           3075  List accounts.
+get_account              905  Get one account by id.
+create_contact          1378  Create one contact.
+...
+11 tools, 24258 characters (instructions: 868 characters)
+```
+
+- `HEADERS`: `Name: value` pairs separated by `;` or newlines (a value that
+  contains `;` goes on a line of its own).
+- `FORMAT`: `json` (the default: `{"instructions": ..., "tools": [...]}`) or
+  `summary` (a line per tool with its size in compact-JSON characters and the
+  first sentence of its description, then the total).
+- `TOOL=list_accounts`: only that tool (its full definition for `json`).
+
+Per-request ACLs and `allow_mcp` conditions are evaluated with the given
+headers only: there is no session, and no cookies unless you pass a `Cookie`
+header. The call is `StandardMCP::Preview.call(headers:, format:, tool:, io:)`.
 
 ## Mounting the endpoint
 
@@ -172,7 +304,8 @@ StandardMCP.configure do |config|
   config.server_name = 'my-app'              # default: the app's module name
   config.server_version = '1.0.0'            # default: the gem's version
   config.parent_controller = 'ApplicationController'
-  config.instructions = ->(request) { '...' } # String or callable; default: the database comment
+  config.instructions = ->(request, default) { "#{default}\n\n..." } # default: generated from comments; see above
+  config.lint_ignore_columns = %w[id created_at updated_at]
   config.dispatch_env = ->(request) { {} }
   config.default_limit = 25
   config.input_schema_depth = 'shallow'      # or 'deep'
@@ -200,6 +333,10 @@ end
   endpoint's own origin; nil accepts only that. Regexps are anchored to the
   whole origin, so `/https:\/\/[a-z]+\.example\.com/` won't accept
   `https://app.example.com.evil.example`.
+- `instructions`: nil generates them from the comments; a String or a callable
+  taking the request replaces that, a callable taking the request and the
+  generated text adds to it, false sends none.
+- `lint_ignore_columns`: columns `standard_mcp:lint` doesn't expect a comment on.
 - `exception_reporter`: called with unexpected errors; nil keeps the mcp gem's.
 
 Argument validation against the tool's input schema is always on.

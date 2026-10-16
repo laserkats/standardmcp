@@ -16,5 +16,10 @@ module StandardMCP
     # and an eager-loaded app would never trigger it.
     config.to_prepare { StandardMCP.define_server_controller! }
 
+    # standard_mcp:lint and standard_mcp:tools
+    rake_tasks do
+      load File.expand_path('../../tasks/standard_mcp.rake', __FILE__)
+    end
+
   end
 end

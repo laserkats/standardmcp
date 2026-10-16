@@ -30,6 +30,18 @@ class Contact < ActiveRecord::Base
   validates :email, format: { with: /\A[^@\s]+@[^@\s]+\z/ }, allow_nil: true
   validates :role, inclusion: { in: %w[member admin] }
   validates :age, numericality: { greater_than_or_equal_to: 0, less_than: 150 }, allow_nil: true
+
+  # Callbacks that refuse a delete: "Locked" says why, "Silent" doesn't.
+  before_destroy :refuse_delete
+
+  private
+
+  def refuse_delete
+    return unless %w[Locked Silent].include?(name)
+
+    errors.add(:base, 'Locked contacts cannot be deleted') if name == 'Locked'
+    throw :abort
+  end
 end
 
 # = Create/recreate database and schema
@@ -38,6 +50,12 @@ ActiveRecord::Tasks::DatabaseTasks.drop(db_config)
 ActiveRecord::Tasks::DatabaseTasks.create(db_config)
 
 ActiveRecord::Migration.verbose = false
+
+connection = ActiveRecord::Base.connection
+connection.execute(<<~SQL)
+  COMMENT ON DATABASE #{connection.quote_table_name(connection.current_database)}
+  IS #{connection.quote('Property management data: customer accounts, the properties they own and the people to reach.')}
+SQL
 
 ActiveRecord::Schema.define do
   create_table "accounts", force: :cascade, comment: "A customer organization that owns properties." do |t|

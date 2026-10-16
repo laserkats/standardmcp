@@ -104,22 +104,41 @@ class EndpointTest < ActionDispatch::IntegrationTest
     assert_equal 'Hello Ben', result['instructions']
   end
 
-  test "instructions default to the database comment" do
+  test "instructions default to the generated ones" do
     ActiveRecord::Base.connection.stubs(:database_comment).returns('Property management data.')
     rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } })
 
-    assert_equal 'Property management data.', result['instructions']
+    instructions = result['instructions']
+    assert instructions.start_with?("Property management data.\n\nResources:\n")
+    assert_includes instructions, 'accounts: A customer organization that owns properties. Tools: list_accounts, get_account, calculate_accounts.'
+    refute_includes instructions, 'staff'
   end
 
-  test "there are no instructions without a configuration or a database comment" do
-    ActiveRecord::Base.connection.stubs(:database_comment).returns(nil)
+  test "the generated instructions follow the request" do
+    rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } },
+      headers: { 'X-MCP-Staff' => 'true', 'X-MCP-Writes' => 'true' })
+
+    assert_includes result['instructions'], 'staff/accounts: '
+    assert_includes result['instructions'], 'create_contact'
+  end
+
+  test "there are no instructions when they are switched off" do
+    StandardMCP.config.instructions = false
     rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'test', version: '1' } })
 
     assert_nil result['instructions']
   end
 
-  test "the database comment is only read for the methods that send instructions" do
-    ActiveRecord::Base.connection.expects(:database_comment).never
+  test "server/discover sends the instructions too" do
+    StandardMCP.config.instructions = 'Discover me.'
+    rpc('server/discover')
+
+    assert_equal 'Discover me.', result['instructions']
+  end
+
+  test "the generated instructions are only worked out for the methods that send them" do
+    StandardMCP::Instructions.expects(:generate).never
+    StandardMCP::Instructions.expects(:for).never
 
     tool_names
     call_tool('list_accounts')

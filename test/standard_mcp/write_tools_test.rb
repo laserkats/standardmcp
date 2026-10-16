@@ -444,6 +444,32 @@ class WriteToolsTest < ActiveSupport::TestCase
     assert Contact.exists?(other.id)
   end
 
+  test "a delete a callback aborts says why, in the model's words" do
+    contact = create(:contact, name: 'Locked')
+
+    assert_equal 'Contact could not be deleted: Locked contacts cannot be deleted',
+      tool_error('delete_contact', { id: contact.id }, writes(contact.account_id))
+    assert Contact.exists?(contact.id)
+  end
+
+  test "a delete a callback aborts without a reason says only that" do
+    contact = create(:contact, name: 'Silent')
+
+    assert_equal 'Contact could not be deleted', tool_error('delete_contact', { id: contact.id }, writes(contact.account_id))
+    assert Contact.exists?(contact.id)
+  end
+
+  test "a save a callback aborts is reported the same way" do
+    dispatcher = StandardMCP::Dispatcher.new(request_for(writes))
+    contact = Contact.new(name: 'Pat')
+    contact.errors.add(:base, 'Not today')
+    error = ActiveRecord::RecordNotSaved.new('Failed to save the record', contact)
+
+    assert_equal 'Contact could not be saved: Not today', dispatcher.send(:error_message, error, 422, :update)
+    assert_equal 'Record could not be deleted',
+      dispatcher.send(:error_message, ActiveRecord::RecordNotDestroyed.new('x'), 422, :destroy)
+  end
+
   test "delete takes only an integer id" do
     contacts = create_list(:contact, 2)
 

@@ -129,22 +129,13 @@ module StandardMCP
       end
     end
 
-    # Seam for richer, comment-driven instructions: override this (or set
-    # `config.instructions`). Only worked out for the methods that send them, so
-    # the default's database query isn't paid on every call.
+    # Seam for the instructions: override this, or set `config.instructions`
+    # (StandardMCP::Instructions). Only worked out for the methods that send
+    # them, so the generated text's queries aren't paid on every call.
     def mcp_instructions
       return unless INSTRUCTION_METHODS.include?(mcp_method_name)
 
-      configured = StandardMCP.config.instructions
-      configured = configured.call(request) if configured.respond_to?(:call)
-      configured.presence || mcp_default_instructions
-    end
-
-    # The database comment, which StandardAPI adds to every adapter (nil where
-    # the adapter has none).
-    def mcp_default_instructions
-      connection = ActiveRecord::Base.connection
-      connection.database_comment.presence if connection.respond_to?(:database_comment)
+      StandardMCP::Instructions.for(request)
     end
 
     def verify_mcp_origin

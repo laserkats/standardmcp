@@ -8,11 +8,17 @@ class Property < ActiveRecord::Base
   belongs_to :account
   has_many :photos
 
+  # An AR enum (string-valued) so the schema's enum path is exercised.
+  enum :kind, { office: 'office', retail: 'retail', industrial: 'industrial' }
+
   validates :name, presence: true
 end
 
 class Photo < ActiveRecord::Base
   belongs_to :property
+
+  # The inclusion-validator path to enum values.
+  validates :format, inclusion: { in: %w[jpg png tiff] }, allow_nil: true
 end
 
 # = Create/recreate database and schema
@@ -35,6 +41,13 @@ ActiveRecord::Schema.define do
     t.string  "name",       comment: "Marketing name of the property."
     t.integer "size",       comment: "Rentable area in square feet."
     t.text    "description", comment: "Free-form description of the property."
+    t.string  "kind",        comment: "Asset class of the property."
+    t.boolean "available",   default: true, comment: "Whether the property can be leased now."
+    t.date    "built_on",    comment: "Date construction finished."
+    t.datetime "listed_at",  comment: "When the property was listed for lease."
+    t.decimal "rent",        precision: 10, scale: 2, comment: "Asking rent per square foot per year."
+    t.string  "tags",        array: true, comment: "Free-form labels."
+    t.jsonb   "metadata",    comment: "Unstructured attributes from the source system."
     t.timestamps
   end
 

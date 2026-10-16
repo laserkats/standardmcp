@@ -55,7 +55,7 @@ class DispatcherTest < ActiveSupport::TestCase
     create(:account, name: 'a')
 
     result = dispatch(AccountsController, :index,
-      { 'where' => { 'name' => ['a', 'b'] }, 'order' => { 'name' => 'desc' }, 'limit' => 1 })
+      { 'where' => { 'name' => { 'in' => ['a', 'b'] } }, 'order' => { 'name' => 'desc' }, 'limit' => 1 })
 
     assert_equal ['b'], result.json.map { |a| a['name'] }
   end
@@ -322,6 +322,46 @@ class DispatcherTest < ActiveSupport::TestCase
 
     assert_equal 400, result.status
     assert_equal({ 'error' => 'Bad Request' }, result.json)
+  end
+
+  # A filter the model-level check (Schema::Where) would have caught reaches
+  # activerecord-filter or Postgres when it is dispatched directly.
+  test "an unknown filter column is a 400 Result" do
+    result = dispatch(PropertiesController, :index, { 'where' => { 'foo' => { 'eq' => 1 } }, 'limit' => 1 })
+
+    assert_equal 400, result.status
+    assert_equal({ 'error' => "where names a column or association that doesn't exist" }, result.json)
+  end
+
+  test "an unsupported filter operator is a 400 Result" do
+    result = dispatch(PropertiesController, :index, { 'where' => { 'size' => { 'bogus' => 1 } }, 'limit' => 1 })
+
+    assert_equal 400, result.status
+    assert_equal({ 'error' => 'where uses an operator or association filter that is not supported' }, result.json)
+  end
+
+  test "an operator Postgres refuses is a 400 Result that leaks neither SQL nor the mask" do
+    mine = create(:account)
+
+    result = dispatch(PropertiesController, :index, { 'where' => { 'size' => { 'ilike' => 'a%' } }, 'limit' => 1 },
+      'Authorization' => "Bearer #{mine.id}")
+
+    assert_equal 400, result.status
+    assert_equal({ 'error' => "where has a value or operator that doesn't fit the column's type" }, result.json)
+    refute_match(/SELECT|account_id|ilike|~~/, result.body)
+  end
+
+  test "a malformed tsquery is a 400 Result" do
+    result = dispatch(PropertiesController, :index, { 'where' => { 'name' => { 'ts_match' => 'a &' } }, 'limit' => 1 })
+
+    assert_equal 400, result.status
+    assert_match(/where has a value or operator/, result.json['error'])
+  end
+
+  test "other database errors are not filter errors" do
+    Account.stubs(:filter).raises(ActiveRecord::StatementInvalid, 'PG::ConnectionBad')
+
+    assert_raises(ActiveRecord::StatementInvalid) { dispatch(AccountsController, :index, { 'limit' => 1 }) }
   end
 
   # --- Result

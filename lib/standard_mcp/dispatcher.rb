@@ -104,7 +104,7 @@ module StandardMCP
       status, headers, rack_body = klass.action(action).call(env)
       Result.new(status: status, headers: headers.to_h, body: collect(rack_body))
     rescue StandardError => e
-      status = client_error_status(e)
+      status = client_error_status(e) || (400 if filter_error(e))
       raise unless status
 
       error_result(status, error_message(e, status))
@@ -163,10 +163,44 @@ module StandardMCP
       status if (400..499).cover?(status)
     end
 
+    # The messages for a `where` that activerecord-filter or Postgres rejected,
+    # which Schema::Where normally catches first (tools check the filter before
+    # dispatching). Rendering is lazy, so the error arrives wrapped in an
+    # ActionView::Template::Error.
+    FILTER_MESSAGES = {
+      unknown: "where names a column or association that doesn't exist",
+      unsupported: 'where uses an operator or association filter that is not supported',
+      database: "where has a value or operator that doesn't fit the column's type"
+    }.freeze
+
+    # :unknown, :unsupported or :database for a filter the query couldn't
+    # build or Postgres refused (bad value or operator, bad tsquery), else nil.
+    # Other database errors are server problems and stay out.
+    def filter_error(error)
+      error = error.cause if error.is_a?(ActionView::Template::Error) && error.cause
+
+      case error
+      when ActiveRecord::UnkownFilterError then :unknown
+      when ActiveRecord::StatementInvalid then :database if database_filter_error?(error.cause)
+      when RuntimeError then :unsupported if error.message.start_with?('Not Supported: ')
+      end
+    end
+
+    def database_filter_error?(cause)
+      return false unless defined?(PG::Error)
+
+      [PG::DataException, PG::SyntaxError, PG::UndefinedFunction, PG::UndefinedObject, PG::DatatypeMismatch].any? { |klass| cause.is_a?(klass) }
+    end
+
     # Exception messages can carry SQL or other internals (RecordNotFound
     # includes the scoped WHERE, which would leak a mask), so only the model
-    # name for 404s and the missing parameter are passed through.
+    # name for 404s, the missing parameter and a fixed sentence per kind of
+    # filter error are passed through.
     def error_message(error, status)
+      if (kind = filter_error(error))
+        return FILTER_MESSAGES.fetch(kind)
+      end
+
       case error
       when ActiveRecord::RecordNotFound
         error.model ? "#{error.model} not found" : 'Not found'

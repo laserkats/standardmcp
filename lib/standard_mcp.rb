@@ -13,6 +13,14 @@ module StandardMCP
   autoload :Registry, 'standard_mcp/registry'
   autoload :Dispatcher, 'standard_mcp/dispatcher'
   autoload :Response, 'standard_mcp/response'
+  autoload :Description, 'standard_mcp/description'
+  autoload :Tools, 'standard_mcp/tools'
+
+  module Schema
+    autoload :Input, 'standard_mcp/schema/input'
+    autoload :Output, 'standard_mcp/schema/output'
+    autoload :Where, 'standard_mcp/schema/where'
+  end
 
   class << self
     def config

@@ -20,7 +20,9 @@ class ActiveSupport::TestCase
 
   self.use_transactional_tests = true
 
-  def setup
+  # A callback, so it runs before the `setup` blocks of the test classes and
+  # they can change the configuration.
+  setup do
     @routes ||= TestApplication.routes
     StandardMCP.reset_config!
   end

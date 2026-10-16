@@ -17,12 +17,65 @@ module StandardMCP
     # the in-process request dispatched to a StandardAPI controller action.
     attr_accessor :dispatch_env
 
+    # Page size for `index` when the controller defines no `default_limit` and
+    # the caller sends no `limit`. StandardAPI rejects an index without a limit
+    # in that case, so a tool must always send one.
+    attr_accessor :default_limit
+
+    # How many association levels the `where` schema nests: 0 offers only the
+    # model's own columns, 1 (the default) adds the columns of its permitted
+    # includes, 2 theirs in turn, and so on. Always bounded by what the
+    # controller's `model_includes` permits; `include` itself is not limited.
+    # Only used when `input_schema_depth` is 'deep'; the shallow `where` lists
+    # every permitted association and checks calls against the model instead.
+    attr_accessor :where_depth
+
+    # How much of the `where` filter the input schemas spell out.
+    #
+    # 'shallow' (the default): `where` is a bare object and the tool
+    # description lists the filterable columns, operators and associations in
+    # prose. That is a fraction of the tokens, and calls are checked against
+    # the model before they run (StandardMCP::Schema::Where), answering with
+    # a readable tool error.
+    #
+    # 'deep': `where` is fully typed (a filter definition per column type,
+    # inline enums, nested association columns bounded by `where_depth`) and the
+    # MCP server rejects a bad filter by schema validation.
+    #
+    # Accepts a String or Symbol.
+    attr_reader :input_schema_depth
+
+    INPUT_SCHEMA_DEPTHS = %w[shallow deep].freeze
+
+    # Whether tools declare an `outputSchema` (and a server can validate
+    # results against it). Off by default: it is about a quarter of the
+    # tools/list payload. `structuredContent` and the text content are
+    # returned either way.
+    attr_accessor :output_schema
+
     def initialize
       @server_name = nil
       @server_version = nil
       @parent_controller = "ApplicationController"
       @instructions = nil
       @dispatch_env = ->(request) { {} }
+      @default_limit = 25
+      @where_depth = 1
+      @input_schema_depth = 'shallow'
+      @output_schema = false
+    end
+
+    def input_schema_depth=(value)
+      depth = value.to_s if value.is_a?(String) || value.is_a?(Symbol)
+      unless INPUT_SCHEMA_DEPTHS.include?(depth)
+        raise ArgumentError, "input_schema_depth must be one of #{INPUT_SCHEMA_DEPTHS.join(', ')}, got #{value.inspect}"
+      end
+
+      @input_schema_depth = depth
+    end
+
+    def deep_input_schema?
+      input_schema_depth == 'deep'
     end
 
     def server_name

@@ -30,10 +30,12 @@ module StandardMCP
 
   module Schema
     autoload :Attributes, 'standard_mcp/schema/attributes'
+    autoload :AttributesDocument, 'standard_mcp/schema/attributes_document'
     autoload :Definitions, 'standard_mcp/schema/definitions'
-    autoload :Document, 'standard_mcp/schema/document'
     autoload :Input, 'standard_mcp/schema/input'
     autoload :Output, 'standard_mcp/schema/output'
+    autoload :Query, 'standard_mcp/schema/query'
+    autoload :QueryDocument, 'standard_mcp/schema/query_document'
     autoload :Where, 'standard_mcp/schema/where'
   end
 

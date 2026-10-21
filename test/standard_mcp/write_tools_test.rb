@@ -104,9 +104,10 @@ class WriteToolsTest < ActiveSupport::TestCase
     StandardMCP::Registry.stubs(:controllers).returns([Billing::AccountsController])
     tools = StandardMCP::Tools.for(request_for)
 
-    assert_equal %w[create_billing_account delete_billing_account describe update_billing_account], tools.map(&:name_value).sort
-    assert_equal ['Create billing account', 'Delete billing account', 'Describe a resource', 'Update billing account'],
-      tools.map { |t| t.title }.sort
+    assert_equal %w[create_billing_account delete_billing_account describe_attributes describe_query update_billing_account],
+      tools.map(&:name_value).sort
+    assert_equal ['Create billing account', 'Delete billing account', 'Describe what a resource can be queried by',
+      'Describe what a resource contains', 'Update billing account'], tools.map { |t| t.title }.sort
   end
 
   test "titles" do
@@ -130,7 +131,8 @@ class WriteToolsTest < ActiveSupport::TestCase
   end
 
   test "descriptions say what to send" do
-    assert_includes tool('create_property')[:description], 'Required: name.'
+    assert_includes tool('create_property')[:description], 'Writable and required attributes: describe_attributes {"resource": "properties"}.'
+    refute_includes tool('create_property')[:description], 'Required: name'
     assert_includes tool('create_property')[:description], 'A real estate asset owned by an account.'
     assert_includes tool('update_property')[:description], 'Send only the attributes to change.'
     assert_includes tool('delete_contact')[:description], 'This is permanent.'
@@ -209,17 +211,25 @@ class WriteToolsTest < ActiveSupport::TestCase
   test "create without a required attribute is rejected before it runs" do
     StandardMCP::Dispatcher.any_instance.expects(:call).never
 
-    assert_match(/Invalid arguments.*name/, tool_error('create_property', { property: { size: 1 } }))
+    assert_match(/missing required properties: name.*describe_attributes {"resource": "properties"}/m,
+      tool_error('create_property', { property: { size: 1 } }))
     assert_match(/Missing required arguments: property/, tool_error('create_property', {}))
     assert_equal 0, Property.count
   end
 
-  test "create with a bad value is rejected by the schema" do
+  test "deep mode rejects a missing required attribute by schema" do
+    StandardMCP.config.input_schema_depth = 'deep'
+    StandardMCP::Dispatcher.any_instance.expects(:call).never
+
+    assert_match(/Invalid arguments.*name/, tool_error('create_property', { property: { size: 1 } }))
+  end
+
+  test "create with a bad value is rejected before it runs, with the attribute named" do
     StandardMCP::Dispatcher.any_instance.expects(:call).never
 
     {
-      { name: 'Tower', kind: 'castle' } => /kind/,
-      { name: 'Tower', size: 'big' } => /size/,
+      { name: 'Tower', kind: 'castle' } => /`\/kind` is not one of: \["office", "retail", "industrial", nil\]/,
+      { name: 'Tower', size: 'big' } => /`\/size` is not one of the types: \["integer", "null"\]/,
       { name: nil } => /name/,
       { name: 'Tower', built_on: 5 } => /built_on/
     }.each do |attributes, expected|
@@ -230,14 +240,30 @@ class WriteToolsTest < ActiveSupport::TestCase
     assert_match(/name/, tool_error('create_contact', { contact: { name: 'x' * 51 } }))
     assert_match(/email/, tool_error('create_contact', { contact: { name: 'Pat', email: 'nope' } }))
     assert_match(/age/, tool_error('create_contact', { contact: { name: 'Pat', age: -1 } }))
+    assert_equal 0, Property.count
   end
 
-  test "an attribute the ACL doesn't permit is rejected by the schema" do
+  test "deep mode rejects a bad value by schema" do
+    StandardMCP.config.input_schema_depth = 'deep'
     StandardMCP::Dispatcher.any_instance.expects(:call).never
 
-    assert_match(/Invalid arguments/, tool_error('create_property', { property: { name: 'Tower', created_at: '2020-01-01T00:00:00Z' } }))
-    assert_match(/Invalid arguments/, tool_error('create_property', { property: { name: 'Tower', id: 7 } }))
-    assert_match(/Invalid arguments/, tool_error('create_contact', { contact: { name: 'Pat', secret: 1 } }))
+    assert_match(/Invalid arguments.*kind/, tool_error('create_property', { property: { name: 'Tower', kind: 'castle' } }))
+  end
+
+  test "an attribute the ACL doesn't permit is rejected before it runs" do
+    StandardMCP::Dispatcher.any_instance.expects(:call).never
+
+    assert_match(/`\/created_at` is a disallowed additional property/,
+      tool_error('create_property', { property: { name: 'Tower', created_at: '2020-01-01T00:00:00Z' } }))
+    assert_match(/`\/id` is a disallowed additional property/, tool_error('create_property', { property: { name: 'Tower', id: 7 } }))
+    assert_match(/`\/secret` is a disallowed additional property/, tool_error('create_contact', { contact: { name: 'Pat', secret: 1 } }))
+  end
+
+  test "the writable attributes are named in the error, once" do
+    message = tool_error('create_contact', { contact: { name: 'Pat', secret: 1, other: 2 } })
+
+    assert_equal 1, message.scan('describe_attributes').size
+    assert_match(/Writable and required attributes: describe_attributes {"resource": "contacts"}\.\z/, message)
   end
 
   test "a validation error StandardAPI finds is a tool error with the errors" do
@@ -325,9 +351,9 @@ class WriteToolsTest < ActiveSupport::TestCase
       assert_equal expected, tool_error('create_property', { property: attributes }), attributes.inspect
     end
 
-    # A loose schema still has a type.
-    assert_match(/Invalid arguments/, tool_error('create_property', { property: { name: 'Tower', photos: 'x' } }))
-    assert_match(/Invalid arguments/, tool_error('create_property', { property: { name: 'Tower', photos: ['x'] } }))
+    # A loose schema still has a type, checked when the call is made.
+    assert_match(/`\/photos` is not an array/, tool_error('create_property', { property: { name: 'Tower', photos: 'x' } }))
+    assert_match(/`\/photos\/0` is not an object/, tool_error('create_property', { property: { name: 'Tower', photos: ['x'] } }))
     assert_equal 0, Property.count
   end
 
@@ -604,7 +630,20 @@ class WriteToolsTest < ActiveSupport::TestCase
     StandardMCP.config.input_schema_depth = 'deep'
     deep = JSON.generate(tool('create_property')[:inputSchema]).size
 
-    assert_operator deep - shallow, :<, 400
+    # The shallow record is an object and a sentence; the deep one types every attribute.
+    assert_operator shallow, :<, deep / 2
+  end
+
+  test "the shallow record schema is loose and names no attribute" do
+    StandardMCP.reset_config!
+
+    create = tool('create_property')[:inputSchema]
+    update = tool('update_property')[:inputSchema]
+
+    assert_equal({ type: 'object', description: "The property's attributes. Writable and required attributes: " \
+      'describe_attributes {"resource": "properties"}.' }, create[:properties][:property])
+    assert_equal 1, update[:properties][:property][:minProperties]
+    refute_includes JSON.generate(create), 'built_on'
   end
 
 end

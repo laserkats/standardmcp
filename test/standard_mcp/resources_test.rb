@@ -91,12 +91,12 @@ class ResourcesTest < ActiveSupport::TestCase
     read("standardmcp://schema/#{resource}", headers)
   end
 
-  def column(doc, name)
-    doc['columns'].find { |c| c['name'] == name } or flunk "no column #{name}"
+  def attribute(doc, name)
+    doc['attributes'].find { |a| a['name'] == name } or flunk "no attribute #{name}"
   end
 
-  def association(doc, name)
-    doc['associations'].find { |a| a['name'] == name } or flunk "no association #{name}"
+  def key(doc, name)
+    doc['where']['keys'].find { |k| k['name'] == name } or flunk "no where key #{name}"
   end
 
   def assert_not_found(uri, headers = {})
@@ -171,7 +171,8 @@ class ResourcesTest < ActiveSupport::TestCase
   end
 
   test "listing renders no schema" do
-    StandardMCP::Schema::Document.expects(:for).never
+    StandardMCP::Schema::QueryDocument.expects(:for).never
+    StandardMCP::Schema::AttributesDocument.expects(:for).never
 
     templates(WRITES)
   end
@@ -220,74 +221,53 @@ class ResourcesTest < ActiveSupport::TestCase
     account = create(:account)
 
     assert_equal %w[my-app://accounts/{id} my-app://gallery/{id} my-app://properties/{id} my-app://schema/{resource}], uri_templates.sort
-    assert_equal 'accounts', read('my-app://schema/accounts')['resource']
+    assert_equal 'accounts', read('my-app://schema/accounts')['query']['resource']
     assert_equal account.name, read("my-app://accounts/#{account.id}")['name']
     assert_not_found "standardmcp://accounts/#{account.id}"
   end
 
   # --- schema document
 
-  test "the schema document names the resource, its table and the tools of the caller" do
+  test "the schema resource is the query and attributes documents, for no where" do
     doc = document('properties')
 
-    assert_equal 'properties', doc['resource']
-    assert_equal 'properties', doc['table']
-    assert_equal 'A real estate asset owned by an account.', doc['description']
-    assert_equal %w[list_properties get_property], doc['tools']
-
-    assert_equal %w[calculate_properties create_property get_property list_properties update_property],
-      document('properties', WRITES)['tools'].sort
+    assert_equal %w[attributes query], doc.keys.sort
+    assert_equal 'properties', doc['query']['resource']
+    assert_equal 'properties', doc['attributes']['resource']
+    assert_equal 'A real estate asset owned by an account.', doc['query']['description']
+    assert_equal 'size', key(doc['query'], 'size')['name']
+    assert_equal 'integer', attribute(doc['attributes'], 'size')['type']
   end
 
-  test "columns carry type, nullability and comment" do
-    doc = document('properties')
+  test "the documents are built for the caller" do
+    reads = document('properties')
+    writes = document('properties', WRITES)
 
-    assert_equal(
-      { 'name' => 'size', 'type' => 'integer', 'nullable' => true, 'description' => 'Rentable area in square feet.',
-        'orderable' => true },
-      column(doc, 'size')
-    )
-    refute column(doc, 'id').key?('nullable')
-    refute column(doc, 'id').key?('description')
-    assert_equal 'datetime', column(doc, 'listed_at')['type']
-    assert_equal 'decimal', column(doc, 'rent')['type']
-    assert_equal 'jsonb', column(doc, 'metadata')['type']
-    assert_equal 'string[]', column(doc, 'tags')['type']
+    refute(reads['attributes']['attributes'].any? { |a| a['writable'] })
+    assert_equal %w[account_id available built_on description kind name rent size],
+      writes['attributes']['attributes'].select { |a| a['writable'] }.map { |a| a['name'] }.sort
+    assert_equal 'contacts', document('contacts', WRITES)['attributes']['resource']
+    # A write-only caller has no where or order to describe.
+    refute document('contacts', WRITES)['query'].key?('where')
+    refute document('contacts', WRITES)['query'].key?('order')
   end
 
-  test "operators are listed once per column type in where, not per column" do
-    doc = document('properties')
+  test "an association links to the resource that serves it, and only that" do
+    assert_equal 'gallery', document('properties')['query']['include'].find { |a| a['name'] == 'photos' }['resource']
+    assert_equal 'properties', document('gallery')['query']['include'].find { |a| a['name'] == 'property' }['resource']
 
-    doc['columns'].each { |c| refute c.key?('filter_operators'), c['name'] }
-    assert_includes doc['where'], 'ilike'
-    assert_includes doc['where'], 'has_key'
-    assert_includes doc['where'], 'overlaps'
+    StandardMCP::Registry.stubs(:controllers).returns([GalleryController])
+    refute document('gallery')['query']['include'].first.key?('resource')
   end
 
-  test "enums come from AR enums and inclusion validators" do
-    assert_equal %w[office retail industrial], column(document('properties'), 'kind')['enum']
-    assert_equal %w[jpg png tiff], column(document('gallery'), 'format')['enum']
-    refute column(document('properties'), 'name').key?('enum')
+  test "hidden columns are absent" do
+    doc = document('gallery')
+
+    refute_includes JSON.generate(doc), 'internal_path'
+    assert_equal %w[id property_id format caption created_at updated_at], doc['attributes']['attributes'].map { |a| a['name'] }
   end
 
-  test "orderable is what the ACL orders allow" do
-    doc = document('properties')
-
-    assert_equal %w[id name size created_at], doc['columns'].select { |c| c['orderable'] }.map { |c| c['name'] }
-  end
-
-  test "writable needs create or update and a permitted column" do
-    refute(document('properties')['columns'].any? { |c| c.key?('writable') })
-
-    doc = document('properties', WRITES)
-    assert_equal %w[account_id name kind size description available built_on rent].sort,
-      doc['columns'].select { |c| c['writable'] }.map { |c| c['name'] }.sort
-    refute column(doc, 'id').key?('writable')
-    refute column(doc, 'created_at').key?('writable')
-    refute column(doc, 'tags').key?('writable')
-  end
-
-  test "an update-only caller can write the columns an update takes" do
+  test "an update-only caller can write the attributes an update takes" do
     controller = Class.new(ApplicationController) do
       allow_mcp only: [:update]
       def self.model = Property
@@ -296,81 +276,42 @@ class ResourcesTest < ActiveSupport::TestCase
     StandardMCP::Registry.stubs(:controllers).returns([controller])
 
     doc = document('patchers')
-    assert column(doc, 'size')['writable']
-    assert_equal %w[update_patcher], doc['tools']
-  end
-
-  test "hidden columns are absent" do
-    doc = document('gallery')
-
-    assert_equal %w[id property_id format caption created_at updated_at], doc['columns'].map { |c| c['name'] }
-    refute_includes JSON.generate(doc), 'internal_path'
-  end
-
-  test "associations say their kind, link the resource and flag what can be done" do
-    doc = document('properties')
-
-    assert_equal(
-      { 'name' => 'account', 'kind' => 'belongs_to', 'resource' => 'accounts',
-        'description' => 'The account that owns this property.', 'includable' => true, 'filterable' => true },
-      association(doc, 'account')
-    )
-    photos = association(doc, 'photos')
-    assert_equal 'has_many', photos['kind']
-    # The gallery controller serves photos.
-    assert_equal 'gallery', photos['resource']
-    assert_equal 'An image attached to a property.', photos['description']
-    refute photos.key?('writable')
-  end
-
-  test "nested attributes make an association writable for a writer" do
-    assert_equal 'nested', association(document('properties', WRITES), 'photos')['writable']
-    refute association(document('properties'), 'photos').key?('writable')
-  end
-
-  test "an association links to a resource the caller can read, and only that" do
-    assert_equal 'properties', association(document('gallery'), 'property')['resource']
-
-    StandardMCP::Registry.stubs(:controllers).returns([GalleryController])
-    refute association(document('gallery'), 'property').key?('resource')
-  end
-
-  test "the where rules are in the document once" do
-    where = document('properties')['where']
-
-    assert_includes where, StandardMCP::Schema::Where::INTRO
-    assert_includes where, 'Operators by column type:'
-    assert_includes where, 'strings also: like'
-    assert_includes where, StandardMCP::Schema::Where::COMBINE
-    assert_includes where, '{"account": {"name": {"eq": "Example"}}}'
-    refute_includes where, 'Columns:'
-  end
-
-  test "the where rules only list the operators of the types the model has" do
-    where = document('accounts')['where']
-
-    refute_includes where, 'array columns'
-    refute_includes where, 'json'
+    assert attribute(doc['attributes'], 'size')['writable']
+    refute doc['query'].key?('where')
   end
 
   test "keys without a value are left out" do
     %w[accounts properties gallery].each { |resource| assert_compact(document(resource, WRITES)) }
   end
 
-  test "the document is built for the caller" do
-    assert_equal %w[get_account list_accounts calculate_accounts].sort, document('accounts')['tools'].sort
-    assert_equal %w[create_contact update_contact delete_contact].sort, document('contacts', WRITES)['tools'].sort
-    assert_equal 'contacts', document('contacts', WRITES)['resource']
+  test "the resource name is the same in the schema resource and the describe tools" do
+    request = request_for(WRITES)
+    entries = StandardMCP::Resources.entries(StandardMCP::Registry.allowed(request))
+
+    assert_equal document('properties', WRITES), StandardMCP::Resources.document(request, entries, 'properties')
+    assert_equal document('properties', WRITES)['query'], StandardMCP::Resources.document(request, entries, 'properties', kind: 'query')
+    assert_nil StandardMCP::Resources.document(request, entries, 'nothing')
   end
 
-  test "the document matches the tool schemas it summarizes" do
+  test "the documents are asked of the hook once for a where" do
     request = request_for(WRITES)
-    controller = StandardMCP::Registry.controller_for(PropertiesController, request)
-    doc = document('properties', WRITES)
-    create = StandardMCP::Schema::Input.for(controller, :create)
+    entries = StandardMCP::Resources.entries(StandardMCP::Registry.allowed(request))
+    where = { 'size' => { 'gte' => 1 } }
+    PropertiesController.any_instance.expects(:model_attribute_definitions).once.with(Property, where)
+      .returns([{ name: 'size', type: 'integer' }])
 
-    writable = doc['columns'].select { |c| c['writable'] }.map { |c| c['name'] }
-    assert_equal create['properties']['property']['properties'].keys.sort, (writable + %w[photos photo_ids]).sort
+    doc = StandardMCP::Resources.document(request, entries, 'properties', where: where)
+
+    assert_equal 'size', doc['attributes']['attributes'].first['name']
+  end
+
+  test "a where that doesn't hold up raises" do
+    request = request_for(WRITES)
+    entries = StandardMCP::Resources.entries(StandardMCP::Registry.allowed(request))
+
+    assert_raises(StandardMCP::Schema::Where::Invalid) do
+      StandardMCP::Resources.document(request, entries, 'properties', where: { 'nope' => { 'eq' => 1 } })
+    end
   end
 
   # --- reading schemas

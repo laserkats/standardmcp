@@ -147,7 +147,7 @@ class EndpointTest < ActionDispatch::IntegrationTest
   # --- tools/list
 
   test "tools/list lists the allowed tools" do
-    assert_equal %w[calculate_accounts describe get_account get_property list_accounts list_properties],
+    assert_equal %w[calculate_accounts describe_attributes describe_query get_account get_property list_accounts list_properties],
       tool_names.sort
   end
 
@@ -238,17 +238,28 @@ class EndpointTest < ActionDispatch::IntegrationTest
   test "resources/read returns the schema document of a controller" do
     doc = read_resource('standardmcp://schema/properties')
 
-    assert_equal 'properties', doc['resource']
-    assert_equal 'Rentable area in square feet.', doc['columns'].find { |c| c['name'] == 'size' }['description']
-    assert_equal %w[list_properties get_property], doc['tools']
-    refute(doc['columns'].any? { |c| c['writable'] })
-    assert(read_resource('standardmcp://schema/properties', headers: WRITES)['columns'].any? { |c| c['writable'] })
+    assert_equal 'properties', doc['query']['resource']
+    assert_equal 'properties', doc['attributes']['resource']
+    assert_equal 'Rentable area in square feet.', doc['attributes']['attributes'].find { |a| a['name'] == 'size' }['description']
+    refute(doc['attributes']['attributes'].any? { |a| a['writable'] })
+    assert(read_resource('standardmcp://schema/properties', headers: WRITES)['attributes']['attributes'].any? { |a| a['writable'] })
   end
 
-  test "the schema document is the one describe returns" do
-    described = call_tool('describe', { resource: 'accounts' })['structuredContent']
+  test "the schema resource is the two documents the describe tools return" do
+    query = call_tool('describe_query', { resource: 'accounts' })['structuredContent']
+    attributes = call_tool('describe_attributes', { resource: 'accounts' })['structuredContent']
 
-    assert_equal described, read_resource('standardmcp://schema/accounts')
+    assert_equal({ 'query' => query, 'attributes' => attributes }, read_resource('standardmcp://schema/accounts'))
+  end
+
+  test "describe_query takes a where over the endpoint" do
+    result = call_tool('describe_query', { resource: 'properties', where: { size: { gte: 1 } } })
+
+    assert_equal 'properties', result['structuredContent']['resource']
+
+    error = call_tool('describe_query', { resource: 'properties', where: { nope: { eq: 1 } } })
+    assert error['isError']
+    assert_match(/Unknown filter key 'nope'/, error['content'].first['text'])
   end
 
   test "resources/read returns a record with mask_for applied through the bearer" do
@@ -294,11 +305,12 @@ class EndpointTest < ActionDispatch::IntegrationTest
   test "resources/read of a schema builds no record templates" do
     StandardMCP::Resources.expects(:record_template).never
 
-    assert_equal 'accounts', read_resource('standardmcp://schema/accounts')['resource']
+    assert_equal 'accounts', read_resource('standardmcp://schema/accounts')['query']['resource']
   end
 
   test "resources/templates/list builds every template and renders no schema" do
-    StandardMCP::Schema::Document.expects(:for).never
+    StandardMCP::Schema::QueryDocument.expects(:for).never
+    StandardMCP::Schema::AttributesDocument.expects(:for).never
 
     assert_equal 3, template_uris.size
   end
@@ -433,7 +445,7 @@ class EndpointTest < ActionDispatch::IntegrationTest
     tool_result = call_tool('list_properties', { where: { foo: { eq: 1 } } })
 
     assert tool_result['isError']
-    assert_match(/Unknown column 'foo'/, tool_result['content'].first['text'])
+    assert_match(/Unknown filter key 'foo'/, tool_result['content'].first['text'])
   end
 
   test "a hidden tool cannot be called" do
@@ -658,7 +670,7 @@ class EndpointTest < ActionDispatch::IntegrationTest
     mine = create(:account)
     create(:account)
 
-    assert_equal %w[calculate_accounts describe get_account get_property list_accounts list_properties],
+    assert_equal %w[calculate_accounts describe_attributes describe_query get_account get_property list_accounts list_properties],
       tool_names(path: '/custom_mcp').sort
     assert_equal [mine.id],
       call_tool('list_accounts', headers: bearer(mine.id), path: '/custom_mcp')['structuredContent']['records'].map { |r| r['id'] }

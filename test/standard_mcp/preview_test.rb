@@ -47,7 +47,7 @@ class PreviewTest < ActiveSupport::TestCase
     printed = JSON.parse(@io.string)
 
     assert_equal %w[instructions tools resourceTemplates], printed.keys
-    assert_equal %w[calculate_accounts describe get_account get_property list_accounts list_properties], printed['tools'].map { |t| t['name'] }.sort
+    assert_equal %w[calculate_accounts describe_attributes describe_query get_account get_property list_accounts list_properties], printed['tools'].map { |t| t['name'] }.sort
     assert_equal StandardMCP::Tools.for(preview_request).map(&:to_h).map { |t| JSON.parse(JSON.generate(t)) }, printed['tools']
     assert_includes printed['instructions'], 'Resources:'
     assert_equal printed['tools'].size, result[:tools].size
@@ -63,7 +63,7 @@ class PreviewTest < ActiveSupport::TestCase
     tool = StandardMCP::Tools.for(preview_request).find { |t| t.name_value == 'list_accounts' }
     assert_equal JSON.generate(tool.to_h).length, size
 
-    assert_match(/\A6 tools, \d+ characters \(instructions: \d+ characters\)\z/, lines[-2])
+    assert_match(/\A7 tools, \d+ characters \(instructions: \d+ characters\)\z/, lines[-2])
   end
 
   test "json carries the resource templates as resources/templates/list does" do
@@ -105,8 +105,8 @@ class PreviewTest < ActiveSupport::TestCase
     result = preview(uri: 'standardmcp://schema/accounts')
     printed = JSON.parse(@io.string)
 
-    assert_equal 'accounts', printed['resource']
-    assert_includes printed['columns'].map { |c| c['name'] }, 'name'
+    assert_equal 'accounts', printed['query']['resource']
+    assert_includes printed['attributes']['attributes'].map { |a| a['name'] }, 'name'
     assert_equal 'standardmcp://schema/accounts', result[:contents][:uri]
   end
 
@@ -183,7 +183,7 @@ class PreviewTest < ActiveSupport::TestCase
     StandardMCP::Registry.stubs(:controllers).returns([PreviewBearerController])
 
     assert_empty preview[:tools]
-    assert_equal %w[describe list_preview_bearer], preview(headers: 'Authorization: Bearer 7')[:tools].map { |t| t[:name] }.sort
+    assert_equal %w[describe_attributes describe_query list_preview_bearer], preview(headers: 'Authorization: Bearer 7')[:tools].map { |t| t[:name] }.sort
   end
 
   test "the configured instructions are previewed" do

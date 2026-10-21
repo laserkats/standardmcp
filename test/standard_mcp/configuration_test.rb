@@ -48,8 +48,22 @@ class ConfigurationTest < ActiveSupport::TestCase
 
   test "the resource settings default to both resources, describe and standardmcp" do
     assert_equal %i[schema records], StandardMCP.config.resources
-    assert_equal true, StandardMCP.config.describe_tool
+    assert_equal true, StandardMCP.config.describe_tools
     assert_equal 'standardmcp', StandardMCP.config.resource_scheme
+  end
+
+  test "max_limit defaults to 100 and takes a positive integer or nil" do
+    assert_equal 100, StandardMCP.config.max_limit
+
+    StandardMCP.config.max_limit = 50
+    assert_equal 50, StandardMCP.config.max_limit
+    StandardMCP.config.max_limit = nil
+    assert_nil StandardMCP.config.max_limit
+
+    [0, -1, 1.5, '10', :ten].each do |value|
+      error = assert_raises(ArgumentError, value.inspect) { StandardMCP.config.max_limit = value }
+      assert_match(/max_limit must be a positive Integer or nil/, error.message)
+    end
   end
 
   test "resources accepts symbols and strings, and an empty list" do

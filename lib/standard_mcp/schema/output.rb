@@ -154,7 +154,11 @@ module StandardMCP
 
       def adapt_column(property, model, column)
         target = column.array && property['items'] ? property['items'] : property
-        [property, target].uniq.each { |s| s.except!(*INPUT_ONLY_KEYWORDS) }
+        # No `format: uuid` either: an app's typed ids needn't be dashed uuids.
+        [property, target].uniq.each do |s|
+          s.except!(*INPUT_ONLY_KEYWORDS)
+          s.delete('format') if s['format'] == 'uuid'
+        end
         # The view nests an array column's whole schema, comment included,
         # under items; the comment describes the column.
         if !target.equal?(property) && target.key?('description')

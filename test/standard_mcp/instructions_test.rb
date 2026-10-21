@@ -82,7 +82,7 @@ class InstructionsTest < ActiveSupport::TestCase
 
   test "the tool names are the ones Tools builds" do
     request = request_for(WRITES.merge('X-MCP-Staff' => 'true'))
-    advertised = StandardMCP::Tools.for(request).map(&:name_value) - ['describe']
+    advertised = StandardMCP::Tools.for(request).map(&:name_value) - %w[describe_query describe_attributes]
     named = StandardMCP::Instructions.for(request).scan(/\b(?:list|get|create|update|delete|calculate)_[a-z_]+/).uniq
       .reject { |name| name.end_with?('_*') }
 
@@ -102,11 +102,23 @@ class InstructionsTest < ActiveSupport::TestCase
     assert_includes writes, "update_* and delete_* take the record's id."
   end
 
-  test "the conventions say what describe returns, with a resource of the caller" do
+  test "the conventions say what the describe tools return, with a resource of the caller" do
     text = instructions
 
-    assert_includes text, %(describe {"resource": "accounts"} returns a resource's columns, types, enums, operators and associations.)
-    refute_includes text, '"/" in its name'
+    assert_includes text, %(describe_query {"resource": "accounts"} returns the keys, operators and associations of where, order and include; )
+    assert_includes text, %(describe_attributes {"resource": "accounts"} returns a record's attributes and which can be written. )
+    assert_includes text, 'Pass them the where you will use, as some keys depend on it.'
+    refute_includes text, '"/" in a resource name'
+  end
+
+  test "no convention makes a describe call mandatory" do
+    refute_match(/\b(first|before|must|always)\b/i, instructions[/Conventions:.*/m])
+  end
+
+  test "the instructions list no column of a model" do
+    text = instructions(WRITES)
+
+    %w[built_on listed_at metadata internal_path caption].each { |name| refute_includes text, name }
   end
 
   test "the describe line tells how a namespaced resource is written" do
@@ -119,12 +131,12 @@ class InstructionsTest < ActiveSupport::TestCase
     StandardMCP::Registry.stubs(:controllers).returns([namespaced, AccountsController])
 
     assert_includes instructions, 'billing/accounts: '
-    assert_includes instructions, 'describe {"resource": "billing_accounts"} returns'
-    assert_includes instructions, '(write a "/" in its name as "_")'
+    assert_includes instructions, 'describe_query {"resource": "billing_accounts"} returns'
+    assert_includes instructions, '(write a "/" in a resource name as "_")'
   end
 
   test "the describe line is there only when describe is" do
-    StandardMCP.config.describe_tool = false
+    StandardMCP.config.describe_tools = false
 
     refute_includes instructions, 'describe'
   end

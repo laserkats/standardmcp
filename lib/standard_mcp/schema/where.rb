@@ -3,279 +3,331 @@ require 'json_schemer'
 
 module StandardMCP
   module Schema
-    # The `where` filter in shallow mode (Configuration#input_schema_depth).
+    # The `where` filter in shallow mode (Configuration#input_schema_depth), and
+    # the checks every call's filter, order and include go through.
     #
-    # The schema is a loose object and the description carries the rules the
-    # deep schema enforces: the operator object every column takes, the
-    # operators per type, the filterable columns and the associations that can
-    # be nested. Because the schema no longer rejects a bad filter, +errors+
-    # checks a call against the model, with the same operator tables the deep
-    # schema is built from, so the model gets a readable message instead of an
-    # exception from activerecord-filter or Postgres.
+    # The shallow schema is a loose object and a sentence: the keys, operators
+    # and associations are what `describe_query` returns (QueryDocument), not
+    # something every tool list repeats. Because the schema doesn't reject a bad
+    # filter, +errors+ checks a call against the model the way StandardAPI will,
+    # with the same operator tables the deep schema is built from, so the agent
+    # gets a readable message, one that names the describe call to make, instead
+    # of an exception from activerecord-filter or Postgres.
     #
-    # Hidden columns and associations, and associations the controller does
-    # not permit to include, don't exist as far as a filter is concerned.
+    # Nothing is stateful: no describe call is needed first. A key is resolved
+    # against the ACL's `wheres` of the model and, at the top level, the
+    # definitions for the where the agent passed (Definitions); records reached
+    # through an association are judged by their own ACL, with the definitions
+    # for no where.
     module Where
-      # Operators for each family of columns. Only the families a model has
-      # are described.
-      OPERATORS = {
-        ordered: 'eq, not, in, not_in, gt, gte, lt, lte',
-        text: 'like (case-sensitive SQL pattern, % matches any run of characters), ilike (case-insensitive pattern), ' \
-          'ts_match (Postgres to_tsquery syntax, or [query, language])',
-        boolean: 'eq, not',
-        other: 'eq, not, in, not_in',
-        array: 'eq, not, contains, contained_by, overlaps, excludes',
-        json: 'eq and not (null only), contains, contained_by, has_key, has_keys, has_any_key',
-        range: 'eq, not, contains, contained_by, overlaps',
-        geometry: 'eq, contains, within, intersects, overlaps'
-      }.freeze
+      # The filter doesn't hold up. +errors+ are messages for the agent.
+      class Invalid < StandardMCP::Error
+        attr_reader :errors
 
-      FAMILY_NAMES = { array: 'array columns', json: 'json', range: 'ranges', geometry: 'geometry' }.freeze
-
-      NUMBERS = %i[integer bigint float decimal].freeze
-
-      INTRO = 'Filter records; all keys must match. Every key is a column or an association name, and every column ' \
-        'takes an operator object, e.g. {"size": {"gte": 1000}}, {"kind": {"in": ["office", "retail"]}}, ' \
-        '{"name": {"eq": null}} for is null, {"name": {"not": null}} for is not null.'.freeze
-
-      COMBINE = 'To combine filters, pass an array alternating filters with "AND" or "OR", e.g. [{...}, "OR", {...}]; ' \
-        'it is evaluated left to right with no precedence.'.freeze
+        def initialize(errors)
+          @errors = errors
+          super(errors.join('; '))
+        end
+      end
 
       # Past this many characters a rejected value is cut in the message.
       VALUE_LENGTH = 60
 
+      AGGREGATES = %w[minimum maximum average sum count].freeze
+
       class << self
-        # The `where` property of a tool's input schema. +tree+ is
-        # Input.includes(controller). A filter is an object, or an array
-        # alternating filters with AND/OR, hence both types.
-        def schema(controller, model, tree)
-          { 'type' => %w[object array], 'description' => description(controller, model, tree) }
+        # The `where` property of a tool's input schema in shallow mode. A
+        # filter is an object, or an array alternating filters with AND/OR,
+        # hence both types.
+        def schema(controller)
+          call = Description.describe_call(controller, 'describe_query')
+          sentences = ['Filter records with operator objects, e.g. {"size": {"gte": 1000}}; all keys must match.']
+          sentences << "Keys, operators and associations: #{call} (pass the same where)." if call
+
+          { 'type' => %w[object array], 'description' => sentences.join(' ') }
         end
 
-        # Why +where+ can't run, as messages for the model; empty when it can.
-        # +where+ is String-keyed: a Hash, or an array alternating filters
-        # with AND/OR.
-        def errors(controller, where)
-          check = Check.new(controller, Input.includes(controller))
-          check.run(controller.class.model, where)
+        # Why +where+ can't run, as messages for the agent; empty when it can.
+        # +where+ is String-keyed: a Hash, or an array alternating filters with
+        # AND/OR. +definitions+ is the Definitions::Result for it when the
+        # caller already has one (the hook is asked once per call).
+        def errors(controller, where, definitions: nil)
+          return [] if where.nil?
+
+          shape = Check.shape_errors(where)
+          return shape if shape.any?
+
+          definitions ||= Definitions.for(controller, controller.class.model, where)
+          check = Check.new(controller, definitions)
+          check.run(where)
           check.errors
         end
 
-        # The reflection when a filter can nest through +name+, else nil: the
-        # controller must permit the include (+tree+), its class must resolve,
-        # it can't be polymorphic, and a visible column of the same name wins.
-        def association(controller, model, tree, name)
-          return unless tree.key?(name.to_s)
-          return if visible_columns(controller, model).any? { |column| column.name == name.to_s }
+        # The definitions for +where+, once it has checked out; raises Invalid
+        # with the problems when it hasn't. For the describe tools, which tell
+        # the agent about a where it could not use.
+        def checked_definitions(controller, where)
+          model = controller.class.model
+          return Definitions.for(controller, model, nil) if where.nil?
 
-          reflection = model.reflect_on_association(name)
-          reflection if reflection && !reflection.polymorphic? && Input.klass_for(reflection)
+          shape = Check.shape_errors(where)
+          raise Invalid, shape if shape.any?
+
+          definitions = Definitions.for(controller, model, where)
+          problems = errors(controller, where, definitions: definitions)
+          raise Invalid, problems if problems.any?
+
+          definitions
         end
 
-        # "string", "string[]", or "office|retail" for an enum.
-        def label(model, column)
-          values = Input.allowed_values(model, column)
-          return values.join('|') if values
+        # Problems with a call's top-level `order` and `include` (the keys of
+        # nested ones are StandardAPI's to check).
+        def order_errors(controller, order)
+          return [] if order.nil?
 
-          column.array ? "#{column.type}[]" : column.type.to_s
+          permitted = Input.orders(controller).flat_map { |entry| entry.is_a?(Hash) ? entry.keys : [entry] }
+          unknown = keys_of(order).reject { |key| permitted.include?(key.split('.').first) }
+          unknown.map do |key|
+            ["Unknown order key '#{key}' for #{Resources.resource_name(controller.class)}.",
+              hint(controller, 'to see the keys you can order by')].compact.join(' ')
+          end
         end
 
-        # The rules a filter follows, without the lists of columns and
-        # associations: the operator object, the operators of the column types
-        # this controller's model has, and AND/OR. What the resource schema
-        # (Schema::Document) says once for a controller.
-        def rules(controller, model, tree)
-          columns = visible_columns(controller, model)
-          example = association_example(controller, model, tree)
-          nesting = "To filter on an association's columns, nest them under its name, e.g. #{example}." if example
+        def include_errors(controller, include)
+          return [] if include.nil?
 
-          [INTRO, operators(model, columns), nesting, COMBINE].compact.join("\n")
+          permitted = Input.includes(controller).keys
+          unknown = keys_of(include).reject { |key| permitted.include?(key) }
+          unknown.map do |key|
+            ["Unknown include key '#{key}' for #{Resources.resource_name(controller.class)}.",
+              hint(controller, 'to see the associations you can include')].compact.join(' ')
+          end
         end
 
-        def visible_columns(controller, model)
+        # Problems with a calculate's `select` and `group_by`, which are
+        # aggregated in SQL and so name real columns only (never a dotted name,
+        # which StandardAPI would turn into a model).
+        def calculate_errors(controller, select, group_by)
+          return [] if select.nil? && group_by.nil?
+
+          model = controller.class.model
+          resource = Resources.resource_name(controller.class)
           hidden = Input.hidden(controller, model)
-          model.columns.reject { |column| hidden.include?(column.name) }
+          columns = model.columns.reject { |column| hidden.include?(column.name) }
+          names = Input.aggregate_names(columns)
+          unknown = ->(name, where) do
+            ["Unknown attribute #{show(name)} in #{where} for #{resource}.",
+              hint(controller, 'to see the attributes', tool: 'describe_attributes')].compact.join(' ')
+          end
+          errors = []
+
+          Array(select).each do |item|
+            next unless item.is_a?(Hash)
+
+            item.each do |function, argument|
+              function = function.to_s
+              unless AGGREGATES.include?(function)
+                errors << "Unknown aggregate '#{function}' in select; use #{AGGREGATES.join(', ')}."
+                next
+              end
+
+              column = argument.is_a?(Hash) ? argument['distinct'] : argument
+              takes = names.fetch(function, [])
+              if argument.is_a?(Hash) && %w[minimum maximum].include?(function)
+                errors << "#{function} doesn't take distinct."
+              elsif takes.include?(column) || (function == 'count' && column == '*' && !argument.is_a?(Hash))
+                next
+              elsif columns.none? { |candidate| candidate.name == column }
+                errors << unknown.call(column, "select")
+              else
+                errors << "#{function} can't be used on '#{column}'#{"; it takes: #{takes.join(', ')}" if takes.any?}."
+              end
+            end
+          end
+
+          if group_by
+            groupable = columns.reject { |column| Input.ungroupable?(column) }.map(&:name)
+            errors << unknown.call(group_by, 'group_by') unless groupable.include?(group_by)
+          end
+
+          errors
+        end
+
+        # "Call describe_query {...} to see the keys you can filter on.", or nil
+        # without the describe tools. +with_where+ says the where passed
+        # matters to the answer.
+        def hint(controller, purpose, resource: nil, with_where: false, tool: 'describe_query')
+          return unless StandardMCP.config.describe_tools
+
+          call = %(#{tool} {"resource": "#{resource || Resources.resource_name(controller.class)}"})
+          "Call #{call}#{' with this where' if with_where} #{purpose}."
+        end
+
+        # A value as it reads in a message, cut when long.
+        def show(value)
+          text = JSON.generate(value)
+          text.length > VALUE_LENGTH ? "#{text[0, VALUE_LENGTH]}..." : text
         end
 
         private
 
-        def description(controller, model, tree)
-          columns = visible_columns(controller, model)
-
-          [
-            INTRO,
-            operators(model, columns),
-            "Columns:\n#{columns.map { |column| column_line(model, column) }.join("\n")}",
-            associations(controller, model, tree),
-            COMBINE,
-            Description.describe_pointer(controller)
-          ].compact.join("\n")
-        end
-
-        # :enum for a column restricted to a list of values, else the kind
-        # Input uses to pick its operators.
-        def kind(model, column)
-          Input.allowed_values(model, column) ? :enum : Input.column_kind(column)
-        end
-
-        def operators(model, columns)
-          kinds = columns.map { |column| kind(model, column) }.uniq
-          lines = []
-
-          if kinds.include?(:ordered) || kinds.include?(:text)
-            ordered = columns.select { |column| kind(model, column) == :ordered }
-            words = []
-            words << 'numbers' if ordered.any? { |column| NUMBERS.include?(column.type) }
-            words << 'dates' if ordered.any? { |column| !NUMBERS.include?(column.type) }
-            words << 'strings' if kinds.include?(:text)
-            lines << "#{words.to_sentence(two_words_connector: ' and ', last_word_connector: ' and ')}: #{OPERATORS[:ordered]}"
+        # The names an `order` or `include` argument uses at its top level: a
+        # Hash's keys, an Array's Strings and Hash keys, or a String.
+        def keys_of(value)
+          case value
+          when Hash then value.keys.map(&:to_s)
+          when Array then value.flatten.flat_map { |item| keys_of(item) }
+          when String, Symbol then [value.to_s]
+          else []
           end
-          lines << "strings also: #{OPERATORS[:text]}" if kinds.include?(:text)
-          lines << "booleans: #{OPERATORS[:boolean]}" if kinds.include?(:boolean)
-          lines << "enums, uuids and other types: #{OPERATORS[:other]}" if kinds.include?(:enum) || kinds.include?(:other)
-          FAMILY_NAMES.each { |kind, name| lines << "#{name}: #{OPERATORS[kind]}" if kinds.include?(kind) }
-
-          "Operators by column type:\n#{lines.join("\n")}"
-        end
-
-        # name (string): Display name of the organization.
-        # kind (office|retail): Asset class of the property.
-        def column_line(model, column)
-          line = "#{column.name} (#{label(model, column)})"
-          comment = Description.column(model, column.name)
-          comment ? "#{line}: #{comment}" : line
-        end
-
-        # Every permitted include can be filtered through, at any depth;
-        # where_depth only bounds the deep schema.
-        def associations(controller, model, tree)
-          entries = association_entries(controller, model, tree, nil)
-          return if entries.empty?
-
-          example = association_example(controller, model, tree)
-          heading = 'Associations (filter on their columns by nesting them'
-          heading += ", e.g. #{example}" if example
-          heading += '; a dotted name nests inside the first: properties.photos is {"properties": {"photos": {...}}}' if entries.any? { |path, _| path.include?('.') }
-
-          "#{heading}):\n#{entries.map(&:last).join("\n")}"
-        end
-
-        # [dotted path, "path: table comment"] for each association.
-        def association_entries(controller, model, tree, prefix)
-          tree.flat_map do |name, subtree|
-            reflection = association(controller, model, tree, name)
-            next [] unless reflection
-
-            path = [prefix, name].compact.join('.')
-            description = Input.association_description(model, reflection)
-            [[path, description ? "#{path}: #{description}" : path]] +
-              association_entries(controller, reflection.klass, subtree, path)
-          end
-        end
-
-        # {"properties": {"name": {"eq": "Example"}}}, using a string column of
-        # the first association when it has one.
-        def association_example(controller, model, tree)
-          name = tree.keys.find { |key| association(controller, model, tree, key) }
-          return unless name
-
-          klass = model.reflect_on_association(name).klass
-          columns = visible_columns(controller, klass)
-          column = columns.find { |c| kind(klass, c) == :text } || columns.first
-          return unless column
-
-          value = kind(klass, column) == :text ? '"Example"' : 'null'
-          %({"#{name}": {"#{column.name}": {"eq": #{value}}}})
         end
       end
 
       # One walk over a where value, collecting every problem rather than
-      # stopping at the first so the model can fix them together.
+      # stopping at the first so the agent can fix them together.
       class Check
         attr_reader :errors
 
-        def initialize(controller, tree)
-          @controller = controller
-          @tree = tree
-          @errors = []
+        # The messages for a where that isn't a filter or an AND/OR array of
+        # them, which can't be walked at all.
+        def self.shape_errors(where)
+          case where
+          when Hash then []
+          when Array
+            alternating = where.size.odd? && where.each_with_index.all? do |part, index|
+              index.odd? ? %w[AND OR].include?(part) : part.is_a?(Hash)
+            end
+            alternating ? [] : ['A where array must alternate filter objects with "AND" or "OR", e.g. [{...}, "OR", {...}]']
+          else
+            ["The filter must be an object of keys, got #{Where.show(where)}"]
+          end
         end
 
-        def run(model, where)
+        # +definitions+ is the Definitions::Result of the controller's model for
+        # the where being checked.
+        def initialize(controller, definitions)
+          @controller = controller
+          @definitions = definitions
+          @errors = []
+          @permits = {}
+        end
+
+        def run(where)
+          model = @controller.class.model
           if where.is_a?(Array)
-            sequence(model, where)
+            where.each_slice(2) { |part, _| filter(model, part, nil, @definitions) }
           else
-            filter(model, where, nil, @tree)
+            filter(model, where, nil, @definitions)
           end
         end
 
         private
 
-        def sequence(model, parts)
-          alternating = parts.size.odd? && parts.each_with_index.all? do |part, index|
-            index.odd? ? %w[AND OR].include?(part) : part.is_a?(Hash)
-          end
-
-          unless alternating
-            @errors << 'A where array must alternate filter objects with "AND" or "OR", e.g. [{...}, "OR", {...}]'
-            return
-          end
-
-          parts.each_slice(2) { |part, _| filter(model, part, nil, @tree) }
-        end
-
-        # +trail+ is the dotted path of associations that led to +model+.
-        def filter(model, value, trail, tree)
+        # +trail+ is the dotted path of associations that led to +model+;
+        # +definitions+ is nil below the top level.
+        def filter(model, value, trail, definitions)
           unless value.is_a?(Hash)
-            @errors << "The filter#{" on #{trail}" if trail} must be an object of columns, got #{show(value)}"
+            @errors << "The filter#{" on #{trail}" if trail} must be an object of keys, got #{show(value)}"
             return
           end
 
-          hidden = Input.hidden(@controller, model)
+          permits = permits(model)
           value.each do |key, argument|
             key = key.to_s
             path = [trail, key].compact.join('.')
-            column = model.columns_hash[key] unless hidden.include?(key)
+            permitted = permits.fetch(key.split('.').first) do
+              permits[(key.sub(/_ids\z/, 's') if key.end_with?('_ids'))]
+            end
 
-            if column
-              check_column(model, column, argument, path)
-            elsif (reflection = Where.association(@controller, model, tree, key))
-              filter(reflection.klass, argument, path, tree[key])
-            else
-              unknown(model, key, hidden, tree)
+            if permitted.nil?
+              unknown(model, key, trail)
+              next
+            end
+
+            kind, reflection = Query.classify(model, definitions, key)
+            case kind
+            when :attribute
+              check_attribute(model, definitions, key, permitted, argument, path)
+            when :association
+              below(model, reflection, argument, path)
+            when :other
+              ids = model.reflect_on_association(key.sub(/_ids\z/, 's')) if key.end_with?('_ids')
+              below(model, ids, { 'id' => argument }, path) if ids
             end
           end
         end
 
-        def unknown(model, key, hidden, tree)
-          known = "columns: #{(model.column_names - hidden).join(', ')}"
-          associations = tree.keys.select { |name| Where.association(@controller, model, tree, name) }
-          known += "; associations: #{associations.join(', ')}" if associations.any?
-          @errors << "Unknown column '#{key}' for #{model.table_name} (#{known})"
+        # What is below an association is judged by the associated model's own
+        # ACL. A polymorphic association has no model until `as` names one,
+        # which StandardAPI checks.
+        def below(model, reflection, argument, path)
+          return if reflection.polymorphic?
+
+          klass = Input.klass_for(reflection)
+          filter(klass, argument, path, nil) if klass
         end
 
-        def check_column(model, column, value, path)
-          operators = Input.column_operators(model, column)
+        def permits(model)
+          @permits[model] ||= Query.permits(@controller, model)
+        end
+
+        def unknown(model, key, trail)
+          resource = resource_for(model)
+          under = " (under #{trail})" if trail
+          hint = Where.hint(@controller, 'to see the keys you can filter on', resource: resource, with_where: trail.nil?)
+          @errors << ["Unknown filter key '#{key}' for #{resource}#{under}.", hint].compact.join(' ')
+        end
+
+        # The resource that serves +model+, else its table.
+        def resource_for(model)
+          return Resources.resource_name(@controller.class) if model == @controller.class.model
+
+          links[model] || model.table_name
+        end
+
+        # { model => resource name }, to name the resource behind an association.
+        # A registry that can't be built (duplicate names, which Tools.for
+        # reports) leaves the tables to name them.
+        def links
+          @links ||= Resources.links(Resources.entries(Registry.allowed(@controller.request)))
+        rescue StandardMCP::Error
+          @links = {}
+        end
+
+        def check_attribute(model, definitions, key, permitted, value, path)
+          name = key.split('.').first
+          definition = definitions&.find(name) || { 'name' => name }
+          operators = Input.definition_operators(model, definition)
+          allowed = Query.allowed_operators(@controller, operators.keys, permitted)
 
           unless value.is_a?(Hash) && value.any?
             @errors << "#{path} takes an operator object such as {\"eq\": ...}, got #{show(value)}; " \
-              "operators: #{operators.keys.join(', ')}"
+              "operators: #{allowed.join(', ')}"
             return
           end
 
           value.each do |operator, argument|
-            schema = operators[operator.to_s]
+            operator = operator.to_s
+            schema = operators[operator]
+
             if schema.nil?
-              @errors << "Unsupported operator '#{operator}' for #{path} (#{Where.label(model, column)}); " \
-                "use #{operators.keys.join(', ')}"
+              @errors << "Unsupported operator '#{operator}' for #{path} (#{label(model, definition)}); use #{allowed.join(', ')}"
+            elsif allowed.exclude?(operator)
+              @errors << "Operator '#{operator}' isn't allowed on #{resource_for(model)}.#{key} (allowed: #{allowed.join(', ')})."
             elsif !JSONSchemer.schema(schema).valid?(argument)
               @errors << "Invalid value for #{path}: #{show(argument)} (#{operator} expects #{expects(schema)})"
             end
           end
         end
 
+        # "string", "string[]", or "office|retail" for an enum.
+        def label(model, definition)
+          values = Input.definition_enum(model, definition)
+          values ? values.join('|') : Definitions.type_label(definition) || 'value'
+        end
+
         def show(value)
-          text = JSON.generate(value)
-          text.length > VALUE_LENGTH ? "#{text[0, VALUE_LENGTH]}..." : text
+          Where.show(value)
         end
 
         # A short phrase for what a value schema accepts.

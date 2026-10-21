@@ -17,6 +17,22 @@ end
 
 class SchemaWhereTest < ActiveSupport::TestCase
 
+  # Other test files define MCP controllers of their own, which would be
+  # among the resources an association is named after.
+  setup do
+    StandardMCP::Registry.stubs(:controllers).returns([AccountsController, ContactsController, PropertiesController])
+  end
+
+  # A controller for +model+ that has a path, as a named one does, and whatever
+  # ACL methods the block defines (they win over the test app's ACLs).
+  def anonymous(model, &block)
+    Class.new(ApplicationController) do
+      define_singleton_method(:model) { model }
+      define_singleton_method(:controller_path) { model.model_name.plural }
+      class_eval(&block)
+    end
+  end
+
   def request_for(headers = {})
     env = Rack::MockRequest.env_for('/mcp', headers.transform_keys { |k| "HTTP_#{k.upcase.tr('-', '_')}" })
     ActionDispatch::Request.new(env)
@@ -54,130 +70,43 @@ class SchemaWhereTest < ActiveSupport::TestCase
   test "the schema has no filter definitions" do
     index = schema(PropertiesController)
 
-    refute index.key?('$defs') && index['$defs'].key?('where')
-    assert_equal ['direction'], index['$defs'].keys
+    refute index.key?('$defs')
     refute schema(AccountsController, :calculate).key?('$defs')
-    refute_match(/_filter|\$ref.*where/, JSON.generate(index.except('$defs')))
+    refute_match(/_filter|\$ref/, JSON.generate(index))
   end
 
-  test "the description lists columns with types, comments and enum values" do
+  test "the description is two sentences that point at describe_query for the keys" do
     description = where_description(PropertiesController)
 
-    assert_includes description, "\nid (integer)\n"
-    assert_includes description, "\nsize (integer): Rentable area in square feet.\n"
-    assert_includes description, "\nname (string): Marketing name of the property.\n"
-    assert_includes description, "\ndescription (text): Free-form description of the property.\n"
-    assert_includes description, "\nkind (office|retail|industrial): Asset class of the property.\n"
-    assert_includes description, "\navailable (boolean): Whether the property can be leased now.\n"
-    assert_includes description, "\ntags (string[]): Free-form labels.\n"
-    assert_includes description, "\nmetadata (jsonb): Unstructured attributes from the source system.\n"
+    assert_equal 'Filter records with operator objects, e.g. {"size": {"gte": 1000}}; all keys must match. ' \
+      'Keys, operators and associations: describe_query {"resource": "properties"} (pass the same where).', description
   end
 
-  test "a column without a comment is listed by name and type" do
-    assert_includes where_description(AccountsController), "\nnotes (text)\n"
-  end
-
-  test "the description teaches the operator object and the AND/OR array" do
-    description = where_description(AccountsController)
-
-    assert_includes description, '{"size": {"gte": 1000}}'
-    assert_includes description, '{"name": {"eq": null}} for is null'
-    assert_includes description, 'alternating filters with "AND" or "OR"'
-  end
-
-  test "operators are described for the column types the model has" do
+  test "the description lists no column, operator or association" do
     description = where_description(PropertiesController)
 
-    assert_includes description, 'numbers, dates and strings: eq, not, in, not_in, gt, gte, lt, lte'
-    assert_includes description, 'strings also: like'
-    assert_includes description, 'ilike'
-    assert_includes description, 'ts_match'
-    assert_includes description, 'booleans: eq, not'
-    assert_includes description, 'enums, uuids and other types: eq, not, in, not_in'
-    assert_includes description, 'array columns: eq, not, contains, contained_by, overlaps, excludes'
-    assert_includes description, 'json: eq and not (null only), contains, contained_by, has_key'
-    refute_includes description, 'geometry'
-    refute_includes description, 'ranges'
-  end
-
-  test "operators the model has no column for are left out" do
-    description = where_description(AccountsController)
-
-    assert_includes description, 'strings also: like'
-    refute_includes description, 'booleans'
-    refute_includes description, 'array columns'
-    refute_includes description, 'json:'
-  end
-
-  test "associations are listed with their table comment, without their columns" do
-    description = where_description(AccountsController)
-
-    assert_includes description, "\nproperties: A real estate asset owned by an account.\n"
-    assert_includes description, '{"properties": {"name": {"eq": "Example"}}}'
-    refute_includes description, 'Rentable area'
-    refute_includes description, 'size ('
-  end
-
-  test "a belongs_to association is described by its foreign key comment" do
-    description = where_description(PropertiesController)
-
-    assert_includes description, "\naccount: The account that owns this property.\n"
-    assert_includes description, "\nphotos: An image attached to a property.\n"
-  end
-
-  # StandardAPI no longer lets an ACL nest includes (account_includes can't be
-  # { properties: [:photos] }), so a nested tree is stubbed in.
-  test "nested includes are listed by dotted path at any where_depth" do
-    StandardMCP.config.where_depth = 0
-    StandardMCP::Schema::Input.stubs(:includes).returns({ 'properties' => { 'photos' => {} } })
-    description = where_description(AccountsController)
-
-    assert_includes description, "\nproperties: A real estate asset owned by an account.\n"
-    assert_includes description, "\nproperties.photos: An image attached to a property.\n"
-    assert_includes description, 'properties.photos is {"properties": {"photos": {...}}}'
-  end
-
-  test "no association section without associations" do
-    # An anonymous class has no controller path to point describe at.
-    StandardMCP.config.describe_tool = false
-    klass = Class.new(ApplicationController) do
-      def self.model = Account
-      def account_includes = []
+    %w[available built_on listed_at metadata tags rent photos account like ilike].each do |word|
+      refute_includes description, word
     end
-
-    refute_includes where_description(klass), 'Associations'
   end
 
-  test "hidden columns and associations are absent" do
-    description = where_description(SchemaWhereHidingController)
+  test "without the describe tools the description has no pointer" do
+    StandardMCP.config.describe_tools = false
 
-    refute_includes description, 'rent'
-    refute_includes description, 'photos'
-    assert_includes description, "\naccount: "
-  end
-
-  test "hidden columns of associated models are not offered or accepted" do
-    klass = Class.new(ApplicationController) do
-      def self.model = Account
-      def account_includes = [:properties]
-      def property_excludes(_record) = { size: true }
-    end
-
-    assert_equal [], errors(klass, { 'properties' => { 'name' => { 'eq' => 'HQ' } } })
-    assert_match(/Unknown column 'size' for properties/, errors(klass, { 'properties' => { 'size' => { 'gte' => 1 } } }).first)
+    assert_equal 'Filter records with operator objects, e.g. {"size": {"gte": 1000}}; all keys must match.',
+      where_description(PropertiesController)
   end
 
   test "calculate shares the where of index" do
     assert_equal where_property(AccountsController, :index), where_property(AccountsController, :calculate)
   end
 
-  test "order, include, limit and the rest are the same in both modes" do
+  test "limit, offset and the rest are the same in both modes" do
     shallow = schema(PropertiesController)
     StandardMCP.config.input_schema_depth = 'deep'
     deep = schema(PropertiesController)
 
-    assert_equal deep['properties'].except('where'), shallow['properties'].except('where')
-    assert_equal deep['$defs']['direction'], shallow['$defs']['direction']
+    assert_equal deep['properties'].slice('limit', 'offset', 'distinct'), shallow['properties'].slice('limit', 'offset', 'distinct')
     assert_equal deep['required'], shallow['required']
   end
 
@@ -188,6 +117,56 @@ class SchemaWhereTest < ActiveSupport::TestCase
     assert deep['$defs'].key?('where')
     assert deep['$defs'].key?('integer_filter')
     assert deep.dig('properties', 'where', 'anyOf')
+  end
+
+  test "deep mode offers only the keys the ACL wheres permit" do
+    StandardMCP.config.input_schema_depth = 'deep'
+    klass = anonymous(Property) do
+      def property_includes = [:account, :photos]
+      def property_wheres = [:id, :name, :account]
+    end
+    where = schema(klass).dig('$defs', 'where', 'properties')
+
+    assert_equal %w[id name account], where.keys
+    # The account's own ACL decides what is offered below it.
+    assert_equal %w[id name status notes created_at updated_at], where['account']['properties'].keys
+  end
+
+  test "deep mode offers an association only when it is permitted and included" do
+    StandardMCP.config.input_schema_depth = 'deep'
+    permitted_not_included = anonymous(Property) do
+      def property_includes = [:photos]
+      def property_wheres = [:id, :account, :photos]
+    end
+    where = schema(permitted_not_included).dig('$defs', 'where', 'properties')
+
+    assert_equal %w[id photos], where.keys
+  end
+
+  test "deep mode narrows the operators to the ones the ACL lists" do
+    StandardMCP.config.input_schema_depth = 'deep'
+    klass = anonymous(Property) do
+      def property_wheres = [{ size: [:gt, :lt] }, { name: [:eq, :in] }, { kind: [:eq] }, :available]
+    end
+    defs = schema(klass)['$defs']
+    where = defs['where']['properties']
+
+    assert_equal %w[gt lt], defs[where['size']['$ref'].delete_prefix('#/$defs/')]['properties'].keys
+    assert_equal %w[eq in], defs[where['name']['$ref'].delete_prefix('#/$defs/')]['properties'].keys
+    assert_equal %w[eq], where['kind']['properties'].keys
+    assert_equal %w[eq not], defs[where['available']['$ref'].delete_prefix('#/$defs/')]['properties'].keys
+  end
+
+  test "deep mode accepts a filter_on key without checking its value" do
+    StandardMCP.config.input_schema_depth = 'deep'
+    Property.filter_on(:search) { |value| Property.all }
+    klass = anonymous(Property) do
+      def property_wheres = [:id, :search]
+    end
+
+    assert_equal({}, schema(klass).dig('$defs', 'where', 'properties', 'search'))
+  ensure
+    Property.filters.delete('search')
   end
 
   test "the shallow schema is a fraction of the deep one" do
@@ -222,29 +201,181 @@ class SchemaWhereTest < ActiveSupport::TestCase
     end
   end
 
-  test "an unknown column names the model's columns and associations" do
-    message = errors(PropertiesController, { 'foo' => { 'eq' => 1 } }).first
+  test "an unknown key says which describe call to make" do
+    assert_equal ["Unknown filter key 'foo' for properties. Call describe_query {\"resource\": \"properties\"} " \
+      'with this where to see the keys you can filter on.'],
+      errors(PropertiesController, { 'foo' => { 'eq' => 1 } })
+  end
 
-    assert_match(/\AUnknown column 'foo' for properties \(columns: id, account_id, name, size/, message)
-    assert_includes message, 'associations: account, photos'
+  test "the describe pointer is left out without the describe tools" do
+    StandardMCP.config.describe_tools = false
+
+    assert_equal ["Unknown filter key 'foo' for properties."], errors(PropertiesController, { 'foo' => { 'eq' => 1 } })
+  end
+
+  test "a column the ACL wheres don't permit is unknown" do
+    klass = anonymous(Property) do
+      def property_wheres = [:id, :name]
+    end
+
+    assert_equal [], errors(klass, { 'name' => { 'eq' => 'HQ' } })
+    assert_match(/\AUnknown filter key 'size' for /, errors(klass, { 'size' => { 'gte' => 1 } }).first)
+    assert_match(/\AUnknown filter key 'account' for /, errors(klass, { 'account' => { 'name' => { 'eq' => 'a' } } }).first)
+  end
+
+  test "a model without ACL wheres can't be filtered on" do
+    klass = anonymous(Property) do
+      def property_wheres = []
+    end
+
+    assert_match(/\AUnknown filter key 'id'/, errors(klass, { 'id' => { 'eq' => 1 } }).first)
   end
 
   test "a hidden column is unknown" do
-    assert_match(/Unknown column 'rent'/, errors(SchemaWhereHidingController, { 'rent' => { 'gt' => 1 } }).first)
-    assert_match(/Unknown column 'photos'/, errors(SchemaWhereHidingController, { 'photos' => { 'format' => { 'eq' => 'jpg' } } }).first)
+    assert_match(/Unknown filter key 'rent'/, errors(SchemaWhereHidingController, { 'rent' => { 'gt' => 1 } }).first)
+    assert_match(/Unknown filter key 'photos'/, errors(SchemaWhereHidingController, { 'photos' => { 'format' => { 'eq' => 'jpg' } } }).first)
   end
 
-  test "an association the controller doesn't include is unknown" do
-    klass = Class.new(ApplicationController) do
-      def self.model = Property
+  test "an association is filterable when the ACL wheres permit it, included or not" do
+    klass = anonymous(Property) do
       def property_includes = [:account]
+      def property_wheres = [:id, :photos]
     end
 
-    assert_match(/Unknown column 'photos' for properties/, errors(klass, { 'photos' => { 'id' => { 'eq' => 1 } } }).first)
+    assert_equal [], errors(klass, { 'photos' => { 'id' => { 'eq' => 1 } } })
   end
 
-  test "an unknown column inside an association names that table" do
-    assert_match(/Unknown column 'bogus' for accounts/, errors(PropertiesController, { 'account' => { 'bogus' => { 'eq' => 1 } } }).first)
+  test "an unknown key inside an association names that association's resource" do
+    assert_equal ["Unknown filter key 'bogus' for accounts (under account). " \
+      'Call describe_query {"resource": "accounts"} to see the keys you can filter on.'],
+      errors(PropertiesController, { 'account' => { 'bogus' => { 'eq' => 1 } } })
+  end
+
+  test "an association no resource serves is named by its table" do
+    StandardMCP::Registry.stubs(:controllers).returns([PropertiesController])
+
+    assert_match(/\AUnknown filter key 'bogus' for accounts \(under account\)\. Call describe_query {"resource": "accounts"}/,
+      errors(PropertiesController, { 'account' => { 'bogus' => { 'eq' => 1 } } }).first)
+  end
+
+  test "hidden columns of associated models are not accepted" do
+    klass = anonymous(Account) do
+      def property_excludes(_record) = { size: true }
+    end
+
+    assert_equal [], errors(klass, { 'properties' => { 'name' => { 'eq' => 'HQ' } } })
+    assert_match(/Unknown filter key 'size' for properties \(under properties\)/,
+      errors(klass, { 'properties' => { 'size' => { 'gte' => 1 } } }).first)
+  end
+
+  test "an association's keys are judged by the associated model's own wheres" do
+    # PhotoACL leaves internal_path out of its wheres.
+    assert_match(/Unknown filter key 'internal_path' for /,
+      errors(PropertiesController, { 'photos' => { 'internal_path' => { 'eq' => 'x' } } }).first)
+  end
+
+  test "a key the ACL permits but the model doesn't know is permitted by name" do
+    klass = anonymous(Property) do
+      def property_wheres = [:id, :anything]
+    end
+
+    assert_equal [], errors(klass, { 'anything' => { 'eq' => 1 } })
+  end
+
+  test "an association's ids are checked as ids of the associated model" do
+    assert_equal [], errors(PropertiesController, { 'photo_ids' => { 'in' => [1] } })
+    assert_match(/Invalid value for photo_ids.id: "x"/, errors(PropertiesController, { 'photo_ids' => { 'eq' => 'x' } }).first)
+  end
+
+  test "a filter_on key is permitted by name and its value isn't checked" do
+    Property.filter_on(:search) { |value| Property.all }
+    klass = anonymous(Property) do
+      def property_wheres = [:id, :search]
+    end
+
+    assert_equal [], errors(klass, { 'search' => 'anything', 'id' => { 'eq' => 1 } })
+    assert_equal [], errors(klass, { 'search' => { 'whatever' => [1, 2] } })
+  ensure
+    Property.filters.delete('search')
+  end
+
+  test "an operator the ACL doesn't list for a column is not allowed" do
+    klass = anonymous(Property) do
+      def property_wheres = [{ name: [:eq, :in] }, { size: [:gt, :not] }, :kind]
+    end
+
+    assert_equal [], errors(klass, { 'name' => { 'eq' => 'a', 'in' => ['b'] } })
+    assert_equal ["Operator 'ilike' isn't allowed on properties.name (allowed: eq, in)."],
+      errors(klass, { 'name' => { 'ilike' => 'a%' } })
+    # not is an alias of the neq the ACL lists
+    assert_equal [], errors(klass, { 'size' => { 'gt' => 1, 'not' => 2 } })
+    assert_equal ["Operator 'lt' isn't allowed on properties.size (allowed: not, gt)."], errors(klass, { 'size' => { 'lt' => 1 } })
+    assert_equal [], errors(klass, { 'kind' => { 'in' => ['office'] } })
+  end
+
+  test "an operator that is no operator of the type is unsupported, whatever the ACL lists" do
+    klass = anonymous(Property) do
+      def property_wheres = [{ name: [:eq, :in] }]
+    end
+
+    assert_equal ["Unsupported operator 'contains' for name (string); use eq, in"],
+      errors(klass, { 'name' => { 'contains' => 'a' } })
+  end
+
+  test "a key from the definitions of the where is checked as its type" do
+    klass = anonymous(Property) do
+      def property_wheres = [:id, :custom_score, :custom_label]
+
+      def model_attribute_definitions(model, where)
+        [{ name: 'custom_score', type: 'integer' }, { name: 'custom_label', type: 'string', enum: %w[a b] }]
+      end
+    end
+
+    assert_equal [], errors(klass, { 'custom_score' => { 'gte' => 1 } })
+    assert_equal ['Invalid value for custom_score: "x" (gte expects an integer)'], errors(klass, { 'custom_score' => { 'gte' => 'x' } })
+    assert_match(/Unsupported operator 'like' for custom_score \(integer\)/, errors(klass, { 'custom_score' => { 'like' => 'x' } }).first)
+    assert_match(/Invalid value for custom_label: "c"/, errors(klass, { 'custom_label' => { 'eq' => 'c' } }).first)
+  end
+
+  test "a definition the ACL wheres don't permit is unknown" do
+    klass = anonymous(Property) do
+      def property_wheres = [:id]
+
+      def model_attribute_definitions(model, where)
+        [{ name: 'custom_score', type: 'integer' }]
+      end
+    end
+
+    assert_match(/\AUnknown filter key 'custom_score'/, errors(klass, { 'custom_score' => { 'gte' => 1 } }).first)
+  end
+
+  test "the hook gets the where as passed, once per check" do
+    where = { 'size' => { 'gte' => 1 }, 'name' => { 'eq' => 'a' }, 'account' => { 'name' => { 'eq' => 'b' } } }
+    controller = controller(PropertiesController)
+    controller.expects(:model_attribute_definitions).once.with(Property, where).returns([{ name: 'size', type: 'integer' }, { name: 'name', type: 'string' }])
+
+    assert_equal [], StandardMCP::Schema::Where.errors(controller, where)
+  end
+
+  test "the hook is not asked for a where that has no shape" do
+    controller = controller(PropertiesController)
+    controller.expects(:model_attribute_definitions).never
+
+    assert_match(/must alternate/, StandardMCP::Schema::Where.errors(controller, [{}, {}]).first)
+    assert_match(/must be an object of keys, got 5/, StandardMCP::Schema::Where.errors(controller, 5).first)
+    assert_equal [], StandardMCP::Schema::Where.errors(controller, nil)
+  end
+
+  test "a grouped definition with differing types takes the operators of any of them" do
+    klass = anonymous(Property) do
+      def property_wheres = [:id, :x]
+
+      def model_attribute_definitions(model, where)
+        { 'A' => [{ name: 'x', type: 'integer' }], 'B' => [{ name: 'x', type: 'string' }] }
+      end
+    end
+
+    assert_equal [], errors(klass, { 'x' => { 'eq' => 'a' } })
   end
 
   test "an operator the column's type doesn't take" do
@@ -299,7 +430,7 @@ class SchemaWhereTest < ActiveSupport::TestCase
   end
 
   test "an association takes a filter object" do
-    assert_match(/The filter on account must be an object of columns, got 5/, errors(PropertiesController, { 'account' => 5 }).first)
+    assert_match(/The filter on account must be an object of keys, got 5/, errors(PropertiesController, { 'account' => 5 }).first)
     assert_match(/The filter on photos must be an object/, errors(PropertiesController, { 'photos' => true }).first)
   end
 
@@ -310,7 +441,7 @@ class SchemaWhereTest < ActiveSupport::TestCase
 
     assert_equal 3, messages.size
     assert_match(/Unsupported operator 'ilike' for size/, messages[0])
-    assert_match(/Unknown column 'foo'/, messages[1])
+    assert_match(/Unknown filter key 'foo'/, messages[1])
     assert_match(/Invalid value for account.name: 1/, messages[2])
   end
 
@@ -338,6 +469,72 @@ class SchemaWhereTest < ActiveSupport::TestCase
     controller.expects(:mask_for).never
 
     StandardMCP::Schema::Where.errors(controller, { 'size' => { 'gte' => 'abc' } })
+  end
+
+  # --- order and include
+
+  def order_errors(klass, order)
+    StandardMCP::Schema::Where.order_errors(controller(klass), order)
+  end
+
+  def include_errors(klass, include)
+    StandardMCP::Schema::Where.include_errors(controller(klass), include)
+  end
+
+  test "an unknown order key says which describe call to make" do
+    assert_equal ["Unknown order key 'rent' for properties. Call describe_query {\"resource\": \"properties\"} " \
+      'to see the keys you can order by.'], order_errors(PropertiesController, { 'rent' => 'asc' })
+  end
+
+  test "order keys are the ACL orders, in any of the shapes StandardAPI takes" do
+    assert_equal [], order_errors(PropertiesController, nil)
+    assert_equal [], order_errors(PropertiesController, { 'size' => 'desc', 'name' => { 'asc' => 'nulls_first' } })
+    assert_equal [], order_errors(PropertiesController, 'size')
+    assert_equal [], order_errors(PropertiesController, ['size', { 'name' => 'asc' }])
+    assert_equal [], order_errors(PropertiesController, { 'size.x' => 'asc' }), 'a dotted key is judged by its first segment'
+    assert_equal 2, order_errors(PropertiesController, ['rent', { 'tags' => 'asc' }, 'size']).size
+  end
+
+  test "an unknown include key says which describe call to make" do
+    assert_equal ["Unknown include key 'nope' for properties. Call describe_query {\"resource\": \"properties\"} " \
+      'to see the associations you can include.'], include_errors(PropertiesController, { 'nope' => {} })
+  end
+
+  test "include keys are the ACL includes; nested ones are left to StandardAPI" do
+    assert_equal [], include_errors(PropertiesController, nil)
+    assert_equal [], include_errors(PropertiesController, { 'photos' => true, 'account' => { 'anything' => {} } })
+    assert_equal [], include_errors(PropertiesController, 'photos')
+    assert_equal [], include_errors(PropertiesController, ['photos', { 'account' => {} }])
+    assert_equal 1, include_errors(AccountsController, { 'properties' => {}, 'photos' => {} }).size
+  end
+
+  test "order and include pointers are left out without the describe tools" do
+    StandardMCP.config.describe_tools = false
+
+    assert_equal ["Unknown order key 'rent' for properties."], order_errors(PropertiesController, { 'rent' => 'asc' })
+    assert_equal ["Unknown include key 'nope' for properties."], include_errors(PropertiesController, { 'nope' => {} })
+  end
+
+  # --- checked definitions (what the describe tools check a where with)
+
+  test "checked_definitions returns the definitions of a where that holds up" do
+    definitions = StandardMCP::Schema::Where.checked_definitions(controller(PropertiesController), { 'size' => { 'gte' => 1 } })
+
+    assert_includes definitions.names, 'size'
+    assert_nil definitions.groups
+  end
+
+  test "checked_definitions raises Invalid with the messages of a where that does not" do
+    error = assert_raises(StandardMCP::Schema::Where::Invalid) do
+      StandardMCP::Schema::Where.checked_definitions(controller(PropertiesController), { 'foo' => { 'eq' => 1 }, 'size' => { 'gte' => 'x' } })
+    end
+
+    assert_equal 2, error.errors.size
+    assert_equal error.errors.join('; '), error.message
+  end
+
+  test "checked_definitions takes no where" do
+    assert_includes StandardMCP::Schema::Where.checked_definitions(controller(PropertiesController), nil).names, 'name'
   end
 
 end

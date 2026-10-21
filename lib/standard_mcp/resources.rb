@@ -4,9 +4,11 @@ module StandardMCP
   # The MCP resource templates for one request, built like the tools (per
   # request, closing over it) so what a caller sees depends on the caller:
   #
-  # - `standardmcp://schema/{resource}`: the full detail of a controller's
-  #   model for this caller (Schema::Document), which the shallow tool schemas
-  #   leave out. `resource` is the controller path with `/` written as `_`
+  # - `standardmcp://schema/{resource}`: what a controller's model offers this
+  #   caller, as `{ "query": ..., "attributes": ... }`: the documents the
+  #   `describe_query` and `describe_attributes` tools return for no where
+  #   (Schema::QueryDocument, Schema::AttributesDocument), which the shallow tool
+  #   schemas leave out. `resource` is the controller path with `/` written as `_`
   #   (`admin_accounts`), the segment the tool names use, so it needs no `/`
   #   (a `{var}` of the mcp gem matches one path segment, and nothing is
   #   percent-decoded).
@@ -86,16 +88,33 @@ module StandardMCP
         entries
       end
 
-      # The schema document (a Hash) of resource +name+ for +request+, or nil
+      # { model => resource name } for the models +entries+ serve, to say which
+      # resource describes an association.
+      def links(entries)
+        entries.each_with_object({}) { |entry, result| result[entry.klass.model] ||= entry.name }
+      end
+
+      # The documents of resource +name+ for +request+ (a Hash keyed 'query' and
+      # 'attributes', or just the +kind+ asked for, which is a String), or nil
       # when the caller has no allowed action on that controller (or none
-      # exists). +entries+ is `entries(Registry.allowed(request))`.
-      def document(request, entries, name)
+      # exists). +entries+ is `entries(Registry.allowed(request))`. +where+ is
+      # the where the keys depend on; the definitions are asked for it once. A
+      # where that doesn't hold up raises Schema::Where::Invalid.
+      def document(request, entries, name, where: nil, kind: nil)
         entry = entries.find { |candidate| candidate.name == name }
         return unless entry
 
-        links = entries.each_with_object({}) { |other, result| result[other.klass.model] ||= other.name }
         controller = Registry.controller_for(entry.klass, request)
-        Schema::Document.for(controller, name: entry.name, actions: entry.actions, links: links)
+        definitions = Schema::Where.checked_definitions(controller, where)
+        options = { name: entry.name, actions: entry.actions, links: links(entries), where: where, definitions: definitions }
+        query = -> { Schema::QueryDocument.for(controller, **options) }
+        attributes = -> { Schema::AttributesDocument.for(controller, **options) }
+
+        case kind
+        when 'query' then query.call
+        when 'attributes' then attributes.call
+        else { 'query' => query.call, 'attributes' => attributes.call }
+        end
       end
 
       # Runs one schema read (public: the template body is a block evaluated
@@ -160,8 +179,9 @@ module StandardMCP
           uri_template: "#{base}/{resource}",
           name: 'schema',
           title: 'Resource schema',
-          description: 'Columns with types, enums, filter operators and flags (nullable, orderable, writable), ' \
-            "associations and the where rules of a resource. Resources: #{names.join(', ')}.",
+          description: 'What a resource offers: "query" has the keys and operators of where, the order keys and the ' \
+            'associations to include; "attributes" has the types, comments, enums and flags (writable, required, ' \
+            "withheld) of a record. Resources: #{names.join(', ')}.",
           mime_type: MIME_TYPE
         ) do |resource:, server_context: nil|
           Resources.read_schema(request, entries, resource, "#{base}/#{resource}")

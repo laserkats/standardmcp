@@ -29,7 +29,8 @@ standard_mcp '/mcp'
 - [What StandardAPI provides](#what-standardapi-provides)
 - [Exposing actions with `allow_mcp`](#exposing-actions-with-allow_mcp)
 - [The tools your app gets](#the-tools-your-app-gets)
-- [Resources and `describe`](#resources-and-describe)
+- [Resources and the describe tools](#resources-and-the-describe-tools)
+- [Attributes that depend on the where](#attributes-that-depend-on-the-where)
 - [Application context from the database](#application-context-from-the-database)
 - [Mounting and authentication](#mounting-and-authentication)
 - [Configuration](#configuration)
@@ -40,7 +41,9 @@ standard_mcp '/mcp'
 
 - Ruby 3.2+, Rails 8.0+
 - StandardAPI 9.0+ (your controllers include `StandardAPI::Controller`, ACLs
-  in `app/controllers/acl`)
+  in `app/controllers/acl`), with ACL `wheres` for everything an agent filters
+  on: StandardAPI checks every `where` against them, and so does the gem. A
+  model whose ACL has no `wheres` can't be filtered on
 - PostgreSQL: table and column comments are the application context, and the
   filter operators are activerecord-filter's Postgres set. This is what the gem
   is tested against.
@@ -48,11 +51,13 @@ standard_mcp '/mcp'
 ## Installation
 
 StandardAPI 9 isn't released to RubyGems yet (RubyGems has 7.1.4), and neither
-is StandardMCP, so both come from git for now. Pin refs:
+is StandardMCP, so both come from git for now. Pin refs. The StandardAPI one is
+PR 108 (attribute definitions, `schemas_for` and the ACL `schemas` hook), which
+builds on master's ACL `wheres`:
 
 ```ruby
 # Gemfile
-gem 'standardapi', git: 'https://github.com/waratuman/standardapi.git', ref: '6222967041a6b0c243e1e8aec33dfc2eb13167aa'
+gem 'standardapi', git: 'https://github.com/waratuman/standardapi.git', ref: 'ed41c596b8f7ead7cc20cc1c3a78038e887c9baa'
 gem 'standardmcp', git: 'https://github.com/laserkats/standardmcp.git', ref: '<commit>'
 ```
 
@@ -74,14 +79,16 @@ so the gem reuses StandardAPI rather than reimplementing it:
 
 | StandardAPI piece | What MCP gets from it |
 | --- | --- |
-| ACL `attributes` (strong params) | The write tools' typed attributes; anything else is rejected, and keys a per-record ACL drops come back as `ignored_attributes` |
+| ACL `attributes` (strong params) | Which attributes are writable (`describe_attributes`); anything else is rejected, and keys a per-record ACL drops come back as `ignored_attributes` |
 | ACL `nested` | Nested records in create/update, as StandardAPI accepts them (`photos`, `photo_ids`, foreign keys) |
-| ACL `includes` | The `include` argument and the associations `where` can filter on |
-| ACL `orders` | The `order` argument |
+| ACL `includes` | The `include` argument and the associations `describe_query` lists |
+| ACL `orders` | The `order` argument and the order keys `describe_query` lists |
+| ACL `wheres` | The keys (and, if listed, the operators) a `where` may use: what `describe_query` lists and every call is checked against |
 | ACL `excludes` | Excluded attributes are absent from responses and from every schema and description |
+| ACL `schemas` (PR 108) | Adjusts the attribute definitions, e.g. to mark an attribute `withheld` |
 | `mask_for` | Row-level restriction on every read, count, update and delete; a masked id reads as "not found" |
-| `resource_limit` / `default_limit` | The `limit` maximum and default (`config.default_limit` when the controller has none) |
-| activerecord-filter (`where`) | Filtering with operator objects, checked against the model before the call |
+| `resource_limit` / `default_limit` | The `limit` maximum and default (`config.default_limit` when the controller has none), and `config.max_limit` caps it for MCP |
+| activerecord-filter (`where`) | Filtering with operator objects, checked against the ACL and the model before the call |
 | `calculate` | `calculate_*` tools (count, sum, min, max, average, `group_by`) and the `total` of list pages |
 | jbuilder views (`_record`, includes, eager loading) | The JSON the tools return, identical to your JSON API |
 | `json_schema` view | Output schemas, when you turn them on |
@@ -120,6 +127,18 @@ end
   whose conditions fail is left out of that caller's `tools/list`, and a call
   to it is refused anyway.
 - Row-level restriction belongs in `mask_for`, as for your JSON API.
+- `mcp_request?` tells an agent's request from your app's own. It is true on
+  the controller instance conditions and schemas are evaluated on, and in the
+  in-process request of a tool call: the Dispatcher sets the Rack env key
+  `standardmcp.dispatched` (`StandardMCP::DISPATCHED_ENV`) after
+  `config.dispatch_env`, so that can't drop it. Use it in an ACL or an
+  `if:`/`unless:` to treat agents differently:
+
+  ```ruby
+  def property_attributes(record = nil)
+    mcp_request? ? super - [:internal_notes] : super
+  end
+  ```
 
 ## The tools your app gets
 
@@ -135,9 +154,17 @@ One tool per allowed (controller, action), named from the controller path
 | `update` | `update_account` | `id`, `account` (both required), `include` |
 | `destroy` | `delete_account` | `id` |
 
-Plus `describe` ([below](#resources-and-describe)). Reads are annotated
-read-only and idempotent; create is neither destructive nor idempotent; update
-and delete are destructive and idempotent.
+Plus `describe_query` and `describe_attributes`
+([below](#resources-and-the-describe-tools)). The tool schemas stay small:
+`where`, `order`, `include` and the written record are loose objects that point
+at those two tools, so `tools/list` doesn't grow with the width of your models
+(`input_schema_depth = 'deep'` brings the typed schemas back). Reads are
+annotated read-only and idempotent; create is neither destructive nor
+idempotent; update and delete are destructive and idempotent.
+
+`list_*` takes at most `config.max_limit` records (100 by default), whatever
+the controller's `resource_limit` allows its JSON API: a bigger `limit` is
+rejected by schema validation.
 
 Results are JSON as your API renders it, as both `structuredContent` and text:
 `{"records": [...], "offset": 0, "next_offset": 25, "total": 112}` for lists
@@ -147,32 +174,50 @@ for calculate and `{"success": true, "affected_rows": 1}` for delete.
 
 ### Filtering
 
-`where` takes an operator object per column, and associations nest:
+`where` takes an operator object per key, and associations nest:
 
 ```json
 {"where": {"size": {"gte": 1000}, "kind": {"in": ["office", "retail"]},
            "name": {"not": null}, "account": {"name": {"ilike": "%acme%"}}}}
 ```
 
-An array alternating filters with `"AND"`/`"OR"` combines them. By default the
-schema keeps `where` a plain object and its description lists the columns
-(type, enum values, comment), the operators per column type and the
-associations, which keeps `tools/list` small. Calls are checked against the
-model before they run, so an unknown column, an operator that doesn't fit the
-type or a bad enum value is a readable tool error, not an empty result. Set
-`input_schema_depth = 'deep'` to have the schema spell all of it out instead.
+An array alternating filters with `"AND"`/`"OR"` combines them. The keys are
+the ones your ACL's `wheres` permit (an ACL can also list the operators a key
+takes: `{ name: [:eq, :in] }`), and an association nests only if the ACL permits
+it by name; what is below it is judged by the associated model's own ACL, as
+StandardAPI does. The schema keeps `where` a plain object with a sentence
+pointing at `describe_query`, which lists the keys, their types, the operators
+and the associations.
+
+Calls are checked against the ACL and the model before they run, with nothing
+to call first. A mistake is a readable tool error that says what to do next, not
+an empty result:
+
+```
+Unknown filter key 'foo' for properties. Call describe_query {"resource": "properties"} with this where to see the keys you can filter on.
+Operator 'like' isn't allowed on properties.name (allowed: eq, in).
+Invalid value for size: "abc" (gte expects an integer)
+Unknown order key 'rent' for properties. Call describe_query {"resource": "properties"} to see the keys you can order by.
+```
+
+A top-level `order` and `include` are checked the same way (what is nested in
+them is StandardAPI's to check), and so are the `select` and `group_by` of a
+calculate, which only name columns.
 
 ### Writes
 
 The record goes under its singular name, as `params.require` expects:
 `{"property": {"name": "Tower", "kind": "office"}, "include": {"photos": true}}`.
 
-- The attributes are the ACL's `attributes`, typed from the columns, with
-  their comments. Ids, timestamps, database-filled columns and excluded ones
-  aren't accepted.
+- The attributes are the ACL's `attributes`, with their types and comments in
+  `describe_attributes`. Ids, timestamps, database-filled columns and excluded
+  ones aren't accepted. The tool schema keeps the record a loose object; the
+  call is held to the typed schema when it is made, so a key the ACL doesn't
+  permit, a value of the wrong type or outside an enum, or a missing required
+  attribute is a tool error that points at `describe_attributes`.
 - Required on create: permitted NOT NULL or presence-validated attributes
   without a default. An update needs at least one attribute.
-- Validators become input constraints where that's safe (enums, `length`,
+- Validators become constraints where that's safe (enums, `length`,
   `numericality` bounds, `format` when the regexp means the same in ECMA 262).
   Conditional validators are left to Rails; their errors come back as tool
   errors with `errors`.
@@ -187,19 +232,49 @@ The record goes under its singular name, as `params.require` expects:
   abort (`"Contact could not be deleted: ..."`) are tool errors in plain words,
   without SQL.
 
-## Resources and `describe`
+## Resources and the describe tools
 
-The tool schemas stay shallow; the full detail is one call or read away.
+The tool schemas stay shallow; the detail is one call or read away. Nothing
+requires a describe call first (calls are checked on their own and their errors
+say which describe call to make), but both take the `where` the agent is about
+to use, since some keys depend on it
+([below](#attributes-that-depend-on-the-where)).
 
-- **`describe`** takes `{"resource": "properties"}` (the controller path with
-  `/` as `_`; its enum lists the caller's own) and returns a compact document:
-  the table comment, the caller's tools, every column (type, nullable,
-  comment, enum, orderable, writable), every association (kind, the resource
-  serving it, whether it can be included, filtered or written through) and the
-  `where` rules once per column type. List, calculate, create and update
-  descriptions end with a pointer to it.
-- **`standardmcp://schema/{resource}`** is the same document as a resource
-  template, for clients that read resources.
+- **`describe_query`** takes `{"resource": "properties", "where": {...}}`
+  (the controller path with `/` as `_`; its enum lists the caller's own; `where`
+  is optional) and returns what the caller can ask of a list or calculate. Only
+  the sections the caller can use are there: `where` (index or calculate),
+  `order` (index) and `include` (index, show, create or update).
+
+  ```json
+  {"resource": "properties",
+   "description": "A real estate asset owned by an account.",
+   "where": {
+     "keys": [{"name": "size", "type": "integer", "description": "Rentable area in square feet."},
+              {"name": "kind", "type": "string", "enum": ["office", "retail", "industrial"]},
+              {"name": "name", "type": "string", "operators": ["eq", "in"]},
+              {"name": "search", "kind": "filter"}],
+     "operators": {"integer": ["eq", "not", "in", "not_in", "gt", "gte", "lt", "lte"], "enum": ["eq", "not", "in", "not_in"]},
+     "associations": [{"name": "account", "resource": "accounts"}],
+     "rules": "Every key takes an operator object, e.g. ..."},
+   "order": {"keys": [{"name": "size", "type": "integer"}], "rules": "..."},
+   "include": [{"name": "account", "kind": "belongs_to", "resource": "accounts"}]}
+  ```
+
+  The keys are what the ACL's `wheres` permit (a column it doesn't permit isn't
+  there); a key whose ACL entry lists operators carries its own list, the rest
+  use `operators`, given once per type. A `filter` key is a `filter_on` filter
+  whose value isn't checked. Associations are named with the resource behind
+  them and nothing else: to see an association's keys, describe that resource.
+- **`describe_attributes`** takes the same arguments and returns what a record
+  contains, for reads and writes: each attribute's type, comment and enum, and
+  flags that are there only when true: `nullable`, `writable` (create or update
+  can set it), `required` (create must send it) and `withheld` (the value may be
+  left out of a record for privacy, see below). Plus the associations the caller
+  can include or write through, by name, kind and resource.
+- **`standardmcp://schema/{resource}`** is `{"query": ..., "attributes": ...}`,
+  the two documents for no where, as a resource template for clients that read
+  resources.
 - **`standardmcp://<resource>/{id}`** (e.g. `standardmcp://accounts/42`) is a
   template per controller the caller may `show`, so a user can attach a
   record as context. Reading it is a dispatched `show`.
@@ -210,7 +285,47 @@ all answer the same "Resource not found" (JSON-RPC -32602). Record reads have
 no `include` (the `mcp` gem only matches plain `{var}` placeholders). The
 endpoint serves templates only (`resources/list` is empty) and is stateless, so
 there are no subscriptions. How a client shows templates or lets the model read
-them is up to the client, which is why `describe` is also a tool.
+them is up to the client, which is why the describe tools exist. A where that
+couldn't list (an unknown key, say) is a tool error from either of them, as it
+would be from `list_*`.
+
+## Attributes that depend on the where
+
+The gem never knows what your models mean. If the attributes of a record depend
+on which records you are asking about (say each project defines its own ticket
+fields), override `model_attribute_definitions(model, where)` on the controller
+(or its parent). `where` is the String-keyed where the agent passed, nil when it
+passed none; the gem calls the method once per describe call or validation, and
+never caches it across requests.
+
+```ruby
+def model_attribute_definitions(model, where)
+  return super unless model == Ticket
+
+  project_ids = where.is_a?(Hash) && where.dig('project_id', 'in')
+  return super unless project_ids
+
+  Project.where(id: project_ids).to_h do |project|
+    [project.name, super + project.fields.map { |field| { name: field.key, type: field.type, comment: field.help } }]
+  end
+end
+```
+
+It returns an Array of definitions in the shape of StandardAPI's
+`schemas_for` (the default; `name`, `type`, `enum`, `default`, `primary_key`,
+`null`, `array`, `comment`, `auto_populated`, `read_only`, `required` and
+`validations`, Symbol keys, only `name` needed), plus one key of the gem's own:
+`withheld: true` says the value may be left out of some records for privacy,
+which the gem can't work out from per-record `excludes`. Set it in the ACL's
+`schemas` hook for a model, or here for a where. Attributes an ACL `excludes`
+hides are dropped.
+
+Or it returns a Hash of labelled Arrays when the where spans several groups
+(`project_id: {in: [...]}` above), and the gem merges them into one document
+with `groups` listing the labels: an attribute that exists in only some groups
+gets `only_in`, one whose type differs gets `types` (a type per group) in place
+of `type`. The keys a `where` may use are still the ACL's `wheres`, so permit
+the names your definitions add (and, to write them, the ACL's `attributes`).
 
 ## Application context from the database
 
@@ -221,8 +336,8 @@ caching; a migration that changes a comment shows up immediately):
 | Comment | Read with | Becomes |
 | --- | --- | --- |
 | Database | `connection.database_comment` (StandardAPI) | The opening paragraph of the server instructions |
-| Table | `connection.table_comment(table)` | Tool descriptions, the table's line in the instructions, the `describe` document |
-| Column | `column.comment` | The column's line in `where`, its description in write inputs and nested records, the `describe` document |
+| Table | `connection.table_comment(table)` | Tool descriptions, the table's line in the instructions, both describe documents |
+| Column | `column.comment` | The key's description in `describe_query`, the attribute's in `describe_attributes` |
 | Foreign key column | `column.comment` | Its association's description (else the associated table's comment) |
 
 Write them in migrations:
@@ -253,7 +368,7 @@ Resources:
 accounts: A customer organization that owns properties. Tools: list_accounts, get_account, calculate_accounts.
 properties: A real estate asset owned by an account. Tools: list_properties, get_property.
 
-Conventions: list_* tools return one page; pass the result's next_offset as offset to get the next. Filters (where) take operator objects such as {"size": {"gte": 1000}}; a tool's where description lists its columns and operators. include embeds associations in the result. describe {"resource": "accounts"} returns a resource's columns, types, enums, operators and associations.
+Conventions: list_* tools return one page; pass the result's next_offset as offset to get the next. Filters (where) take operator objects such as {"size": {"gte": 1000}}. include embeds associations in the result. describe_query {"resource": "accounts"} returns the keys, operators and associations of where, order and include; describe_attributes {"resource": "accounts"} returns a record's attributes and which can be written. Pass them the where you will use, as some keys depend on it.
 ```
 
 Domain knowledge that doesn't fit a single column goes in
@@ -334,12 +449,13 @@ end
 | `dispatch_env` | `->(request) { {} }` | Extra Rack env for the in-process calls |
 | `allowed_origins` | `nil` | Origins accepted besides the endpoint's own: exact Strings (case-insensitive) or Regexps, anchored to the whole origin |
 | `default_limit` | `25` | Page size when neither the controller's `default_limit` nor the caller sets one |
-| `input_schema_depth` | `'shallow'` | `'shallow'`: `where` and nested write records are loose objects described in prose, and calls are checked before dispatch. `'deep'`: both are fully typed in the schema |
+| `max_limit` | `100` | The most one `list_*` call may ask for, apart from the controller's `resource_limit` (the `limit` maximum is the smaller of the two, the default page is held to it); `nil` turns the cap off |
+| `input_schema_depth` | `'shallow'` | `'shallow'`: `where`, `order`, `include` and the written record are loose objects that point at the describe tools, so `tools/list` names no column, and calls are checked before dispatch. `'deep'`: the typed schemas; `where` offers only the keys and operators the ACL's `wheres` permit. Deep types real columns only, not attributes that depend on the where, and grows with your models |
 | `where_depth` | `1` | Deep mode only: association levels `where` spells out, bounded by the ACL's includes |
-| `output_schema` | `false` | Declare an `outputSchema` per tool (from StandardAPI's `json_schema` view; about a quarter more `tools/list`). Results carry `structuredContent` either way |
+| `output_schema` | `false` | Declare an `outputSchema` per tool (from StandardAPI's `json_schema` view). It lists every column of every model again, so next to the small shallow input schemas it is most of `tools/list` (on the gem's test app, 136% more anonymous, 143% more with `X-MCP-Writes: true`). Results carry `structuredContent` either way |
 | `validate_results` | on outside production | Check results against the output schema (needs `output_schema`) |
 | `resources` | `%i[schema records]` | Resource templates served; `[]` for none (and `resources` isn't advertised) |
-| `describe_tool` | `true` | The `describe` tool and the pointers to it |
+| `describe_tools` | `true` | The `describe_query` and `describe_attributes` tools and the pointers to them |
 | `resource_scheme` | `'standardmcp'` | URI scheme of the templates (RFC 3986) |
 | `exception_reporter` | `nil` (the mcp gem's) | Called with unexpected errors |
 | `lint_ignore_columns` | `%w[id created_at updated_at]` | Columns `standard_mcp:lint` doesn't expect comments on |
@@ -388,21 +504,22 @@ caller, without a client:
 
 ```
 $ HEADERS='X-MCP-Writes: true' FORMAT=summary bundle exec rake standard_mcp:tools
-list_accounts           3136  List accounts.
-get_account              905  Get one account by id.
-create_contact          1438  Create one contact.
+list_accounts           1588  List accounts.
+get_account              743  Get one account by id.
+create_contact          1007  Create one contact.
 ...
-describe                 494  Describe a resource: its columns with types, enums and filter operators, and its associations.
+describe_query           868  Describe how to query a resource: the keys of where and order with their types and operators, and the associations to include.
+describe_attributes      968  Describe what a record of a resource contains, for reads and writes: each attribute's type, comment and enum, whether it can be written or must be sent, and whether it can be withheld for privacy.
 
-12 tools, 25244 characters (instructions: 974 characters)
-3 resource templates, 719 characters: standardmcp://schema/{resource}, standardmcp://accounts/{id}, standardmcp://properties/{id}
+13 tools, 13801 characters (instructions: 1084 characters)
+3 resource templates, 803 characters: standardmcp://schema/{resource}, standardmcp://accounts/{id}, standardmcp://properties/{id}
 ```
 
 | ENV | Effect |
 | --- | --- |
 | `HEADERS` | `Name: value` pairs separated by `;` or newlines (a value containing `;` goes on its own line) |
 | `FORMAT=json` (default) / `summary` | Full `{"instructions", "tools", "resourceTemplates"}` JSON, or a line per tool with its size in compact-JSON characters |
-| `TOOL=list_accounts` | Only that tool |
+| `TOOL=list_accounts` | Only that tool (`describe_query`, say) |
 | `URI=standardmcp://schema/accounts` | What reading that URI returns (or the "Resource not found" it answers) |
 
 Conditions and ACLs see only the headers you pass: no session, and no cookies

@@ -1,5 +1,19 @@
 require 'standard_mcp/test_helper'
 
+# Permits a filter key that is neither a column nor an association, which
+# StandardAPI's ACL check lets through to activerecord-filter.
+class DispatcherPhantomWhereController < ApplicationController
+  allow_mcp
+
+  def self.model
+    Property
+  end
+
+  def property_wheres
+    super + [:foo]
+  end
+end
+
 class DispatcherTest < ActiveSupport::TestCase
 
   def request_for(headers = {}, env = {})
@@ -391,10 +405,18 @@ class DispatcherTest < ActiveSupport::TestCase
   # A filter the model-level check (Schema::Where) would have caught reaches
   # activerecord-filter or Postgres when it is dispatched directly.
   test "an unknown filter column is a 400 Result" do
-    result = dispatch(PropertiesController, :index, { 'where' => { 'foo' => { 'eq' => 1 } }, 'limit' => 1 })
+    result = dispatch(DispatcherPhantomWhereController, :index, { 'where' => { 'foo' => { 'eq' => 1 } }, 'limit' => 1 })
 
     assert_equal 400, result.status
     assert_equal({ 'error' => "where names a column or association that doesn't exist" }, result.json)
+  end
+
+  # StandardAPI checks every where against the ACL's wheres before filtering.
+  test "a filter the ACL wheres don't permit is a 400 Result" do
+    result = dispatch(PropertiesController, :index, { 'where' => { 'foo' => { 'eq' => 1 } }, 'limit' => 1 })
+
+    assert_equal 400, result.status
+    assert_match(/foo/, result.body)
   end
 
   test "an unsupported filter operator is a 400 Result" do

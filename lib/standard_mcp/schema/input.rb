@@ -59,7 +59,7 @@ module StandardMCP
         # ({ 'properties' => { 'photos' => {} } }). Associations that an ACL
         # `excludes` hides are dropped, as are StandardAPI's reserved keys.
         def includes(controller)
-          tree = StandardAPI::Includes.normalize(controller.send(:model_includes))
+          tree = controller.send(:normalize_includes, controller.send(:includes_for, controller.class.model))
           prune_includes(controller, controller.class.model, tree)
         end
 
@@ -67,7 +67,7 @@ module StandardMCP
         # through an association ({ 'account' => ['name'] }). Hidden columns are
         # dropped.
         def orders(controller)
-          prune_orders(controller, controller.class.model, controller.send(:model_orders))
+          prune_orders(controller, controller.class.model, controller.send(:orders_for, controller.class.model))
         end
 
         # Column and association names an ACL `excludes` removes from every

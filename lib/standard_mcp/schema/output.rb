@@ -42,7 +42,7 @@ module StandardMCP
         model = controller.class.model
         raise ArgumentError, "#{controller.class} has no model" unless model
 
-        includes = StandardAPI::Includes.normalize(controller.send(:model_includes))
+        includes = controller.send(:normalize_includes, controller.send(:includes_for, model))
         adapt(render(controller, includes), model, controller, nil)
       end
 

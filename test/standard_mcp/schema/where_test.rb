@@ -15,17 +15,6 @@ class SchemaWhereHidingController < ApplicationController
   end
 end
 
-# Includes two levels deep: shallow lists them all, whatever where_depth says.
-class SchemaWhereDeepController < ApplicationController
-  def self.model
-    Account
-  end
-
-  def account_includes
-    [{ properties: [:photos] }]
-  end
-end
-
 class SchemaWhereTest < ActiveSupport::TestCase
 
   def request_for(headers = {})
@@ -136,9 +125,12 @@ class SchemaWhereTest < ActiveSupport::TestCase
     assert_includes description, "\nphotos: An image attached to a property.\n"
   end
 
+  # StandardAPI no longer lets an ACL nest includes (account_includes can't be
+  # { properties: [:photos] }), so a nested tree is stubbed in.
   test "nested includes are listed by dotted path at any where_depth" do
     StandardMCP.config.where_depth = 0
-    description = where_description(SchemaWhereDeepController)
+    StandardMCP::Schema::Input.stubs(:includes).returns({ 'properties' => { 'photos' => {} } })
+    description = where_description(AccountsController)
 
     assert_includes description, "\nproperties: A real estate asset owned by an account.\n"
     assert_includes description, "\nproperties.photos: An image attached to a property.\n"

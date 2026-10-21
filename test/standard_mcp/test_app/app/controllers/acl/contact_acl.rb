@@ -12,4 +12,8 @@ module ContactACL
     [ :account ]
   end
 
+  def wheres
+    [ :id, :account_id, :name, :email, :role, :age, :created_at, :updated_at, :account ]
+  end
+
 end

@@ -12,6 +12,14 @@ module PropertyACL
     [ :account, :photos ]
   end
 
+  def wheres
+    [
+      :id, :account_id, :name, :kind, :size, :description, :available, :built_on,
+      :listed_at, :rent, :tags, :metadata, :created_at, :updated_at,
+      :account, :photos
+    ]
+  end
+
   def nested
     [ :photos ]
   end

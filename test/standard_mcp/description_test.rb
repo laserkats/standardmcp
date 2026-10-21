@@ -47,11 +47,13 @@ class DescriptionTest < ActiveSupport::TestCase
       describe(AccountsController, :calculate)
   end
 
+  # StandardAPI no longer lets an ACL nest includes (account_includes can't be
+  # { properties: [:photos] }), so a nested tree is stubbed in.
   test "nested includes are listed by path" do
     klass = Class.new(ApplicationController) do
       def self.model = Account
-      def account_includes = [{ properties: [:photos] }]
     end
+    StandardMCP::Schema::Input.stubs(:includes).returns({ 'properties' => { 'photos' => {} } })
 
     description = StandardMCP::Description.for(StandardMCP::Registry.controller_for(klass, request_for), :show)
 

@@ -50,17 +50,6 @@ class SchemaInputNoIncludesController < ApplicationController
   end
 end
 
-# Includes two levels deep, to show where_depth bounding the where nesting.
-class SchemaInputDeepController < ApplicationController
-  def self.model
-    Account
-  end
-
-  def account_includes
-    [{ properties: [:photos] }]
-  end
-end
-
 # Write schemas: attributes the ACL lists without a column, Hash entries,
 # per-request attributes, excludes and nested associations.
 class SchemaInputWritesController < ApplicationController
@@ -149,6 +138,13 @@ class SchemaInputTest < ActiveSupport::TestCase
 
     name = node['$ref'].delete_prefix('#/$defs/')
     node.except('$ref').merge(schema['$defs'].fetch(name))
+  end
+
+  # Includes two levels deep, to show where_depth bounding the where nesting.
+  # StandardAPI no longer lets an ACL nest includes (account_includes can't be
+  # { properties: [:photos] }), so the nested tree is stubbed in.
+  def stub_deep_includes
+    StandardMCP::Schema::Input.stubs(:includes).returns({ 'properties' => { 'photos' => {} } })
   end
 
   def where_properties(schema)
@@ -797,7 +793,8 @@ class SchemaInputTest < ActiveSupport::TestCase
   end
 
   test "where_depth 1 nests one association level" do
-    props = where_properties(schema(SchemaInputDeepController, :index))
+    stub_deep_includes
+    props = where_properties(schema(AccountsController, :index))
 
     assert_includes props.keys, 'properties'
     assert_includes props['properties']['properties'].keys, 'name'
@@ -806,7 +803,8 @@ class SchemaInputTest < ActiveSupport::TestCase
 
   test "where_depth 2 nests two levels, bounded by the permitted includes" do
     StandardMCP.config.where_depth = 2
-    s = schema(SchemaInputDeepController, :index)
+    stub_deep_includes
+    s = schema(AccountsController, :index)
     photos = where_properties(s)['properties']['properties']['photos']
 
     assert_includes photos['properties'].keys, 'caption'
@@ -814,11 +812,12 @@ class SchemaInputTest < ActiveSupport::TestCase
     assert valid?(s, { 'where' => { 'properties' => { 'photos' => { 'caption' => { 'eq' => 'x' } } } } })
 
     StandardMCP.config.where_depth = 5
-    assert_equal s, schema(SchemaInputDeepController, :index)
+    assert_equal s, schema(AccountsController, :index)
   end
 
   test "where_depth 1 rejects a second level" do
-    s = schema(SchemaInputDeepController, :index)
+    stub_deep_includes
+    s = schema(AccountsController, :index)
 
     refute valid?(s, { 'where' => { 'properties' => { 'photos' => { 'caption' => { 'eq' => 'x' } } } } })
   end

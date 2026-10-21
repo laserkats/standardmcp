@@ -37,7 +37,7 @@ module StandardMCP
     # How many association levels the `where` schema nests: 0 offers only the
     # model's own columns, 1 (the default) adds the columns of its permitted
     # includes, 2 theirs in turn, and so on. Always bounded by what the
-    # controller's `model_includes` permits; `include` itself is not limited.
+    # model's ACL `includes` permits; `include` itself is not limited.
     # Only used when `input_schema_depth` is 'deep' (nested records of a write
     # are typed to any depth, cycles aside); the shallow `where` lists
     # every permitted association and checks calls against the model instead.

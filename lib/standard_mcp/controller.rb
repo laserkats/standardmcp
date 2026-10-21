@@ -87,6 +87,43 @@ module StandardMCP
       end
     end
 
+    # Whether this request comes from MCP: the in-process request a tool call
+    # dispatched (the Dispatcher marks its env with DISPATCHED_ENV), or the
+    # throwaway instance `allow_mcp` conditions and the schemas are evaluated
+    # on. Lets ACL code and `allow_mcp if:` conditions tell an agent from the
+    # app's own JSON API.
+    def mcp_request?
+      @standard_mcp_request == true || request&.env&.[](DISPATCHED_ENV) == true
+    end
+
+    # The attribute definitions of +model+ the describe tools report and where
+    # keys are checked against.
+    #
+    # +where+ is the where the agent passed, String-keyed (nil when it passed
+    # none; an Array alternating filters with "AND"/"OR" is passed as given).
+    # Override this when an attribute depends on it, e.g. records of one group
+    # carry attributes another group's don't, and add the keys that where
+    # selects. The gem never interprets +where+.
+    #
+    # Returns an Array of definition Hashes in the shape of StandardAPI's
+    # `schemas_for`: Symbol keys `name`, `type`, `enum`, `default`,
+    # `primary_key`, `null`, `array`, `comment`, `auto_populated`, `read_only`,
+    # `required` and `validations`. Only `name` is needed. One key is the gem's
+    # own: `withheld: true` says the value may be left out of some records for
+    # privacy, which the gem can't work out from per-record `excludes`. The
+    # ACL's `schemas` hook (StandardAPI) is the per-model place to set it; this
+    # method is the per-where place.
+    #
+    # Or returns a Hash of labelled Arrays, `{ 'Group A' => [...], 'Group B' =>
+    # [...] }`, when the where spans several groups. The gem merges them: a key
+    # in only some groups is marked `only_in`, one whose type differs gets
+    # `types`.
+    #
+    # Hidden attributes (ACL `excludes`) are dropped from the result.
+    def model_attribute_definitions(model, where)
+      schemas_for(model)
+    end
+
     # Actions exposed for the current request: those whose covering rule's
     # conditions pass on this instance.
     def mcp_actions_allowed

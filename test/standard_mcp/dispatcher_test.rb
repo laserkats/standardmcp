@@ -14,6 +14,19 @@ class DispatcherPhantomWhereController < ApplicationController
   end
 end
 
+# Says whether the request it runs for is MCP's.
+class DispatcherFlagController < ApplicationController
+  allow_mcp only: [:index]
+
+  def self.model
+    Account
+  end
+
+  def index
+    render json: { mcp: mcp_request? }
+  end
+end
+
 class DispatcherTest < ActiveSupport::TestCase
 
   def request_for(headers = {}, env = {})
@@ -167,6 +180,33 @@ class DispatcherTest < ActiveSupport::TestCase
     end
 
     assert_equal 'sam', seen
+  end
+
+  test "every dispatched request carries the dispatched flag" do
+    seen = nil
+    ActiveSupport::Notifications.subscribed(->(*, payload) { seen = payload[:headers][StandardMCP::DISPATCHED_ENV] }, 'process_action.action_controller') do
+      dispatch(AccountsController, :index, { 'limit' => 1 })
+    end
+
+    assert_equal true, seen
+    assert_equal 'standardmcp.dispatched', StandardMCP::DISPATCHED_ENV
+  end
+
+  test "dispatch_env can't drop or change the dispatched flag" do
+    seen = nil
+    StandardMCP.config.dispatch_env = ->(request) { { StandardMCP::DISPATCHED_ENV => false } }
+    ActiveSupport::Notifications.subscribed(->(*, payload) { seen = payload[:headers][StandardMCP::DISPATCHED_ENV] }, 'process_action.action_controller') do
+      dispatch(AccountsController, :index, { 'limit' => 1 })
+    end
+
+    assert_equal true, seen
+  end
+
+  test "the dispatched controller answers true to mcp_request?" do
+    assert_equal({ 'mcp' => true }, dispatch(DispatcherFlagController, :index).json)
+
+    StandardMCP.config.dispatch_env = ->(request) { { StandardMCP::DISPATCHED_ENV => nil } }
+    assert_equal({ 'mcp' => true }, dispatch(DispatcherFlagController, :index).json)
   end
 
   # --- routing context

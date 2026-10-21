@@ -140,6 +140,9 @@ module StandardMCP
       env['rack.session'] = detached_session(env)
 
       env.merge!(StandardMCP.config.dispatch_env.call(request) || {})
+      # Last, so dispatch_env can't drop it.
+      env[DISPATCHED_ENV] = true
+      env
     end
 
     # Reading through the cookie works because the outer session is

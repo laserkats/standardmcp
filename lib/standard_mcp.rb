@@ -8,6 +8,11 @@ require 'standard_mcp/errors'
 require 'standard_mcp/railtie'
 
 module StandardMCP
+  # Rack env key the Dispatcher sets on every in-process request it runs, after
+  # `config.dispatch_env`, so a request MCP dispatched can't be mistaken for one
+  # that wasn't (see Controller#mcp_request?).
+  DISPATCHED_ENV = 'standardmcp.dispatched'.freeze
+
   # Autoloaded so nothing references them at gem load time.
   autoload :Controller, 'standard_mcp/controller'
   autoload :Registry, 'standard_mcp/registry'
@@ -25,6 +30,7 @@ module StandardMCP
 
   module Schema
     autoload :Attributes, 'standard_mcp/schema/attributes'
+    autoload :Definitions, 'standard_mcp/schema/definitions'
     autoload :Document, 'standard_mcp/schema/document'
     autoload :Input, 'standard_mcp/schema/input'
     autoload :Output, 'standard_mcp/schema/output'

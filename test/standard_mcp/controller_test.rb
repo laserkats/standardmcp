@@ -34,6 +34,22 @@ class McpParentAccountsController <ApplicationController
   allow_mcp only: [:index]
 end
 
+# Only for requests MCP makes, as the registry builds them.
+class McpOnlyAccountsController < ApplicationController
+  allow_mcp only: [:index], if: :mcp_request?
+end
+
+# The ACL's schemas hook marks a definition withheld.
+class McpWithheldPropertiesController < ApplicationController
+  def self.model
+    Property
+  end
+
+  def property_schemas(schemas)
+    schemas.map { |schema| schema[:name] == 'rent' ? schema.merge(withheld: true) : schema }
+  end
+end
+
 class McpChildAccountsController < McpParentAccountsController
   allow_mcp only: [:show]
 end
@@ -136,6 +152,53 @@ class ControllerTest < ActiveSupport::TestCase
   test "multiple rules union" do
     request = ActionDispatch::Request.new(Rack::MockRequest.env_for('/'))
     assert_equal [:index, :show], StandardMCP::Registry.controller_for(PropertiesController, request).mcp_actions_allowed
+  end
+
+  # --- mcp_request?
+
+  test "mcp_request? is true for the request a tool call dispatched" do
+    plain = AccountsController.new
+    plain.set_request!(ActionDispatch::Request.new(Rack::MockRequest.env_for('/')))
+    refute plain.mcp_request?
+
+    dispatched = AccountsController.new
+    dispatched.set_request!(ActionDispatch::Request.new(Rack::MockRequest.env_for('/', StandardMCP::DISPATCHED_ENV => true)))
+    assert dispatched.mcp_request?
+  end
+
+  test "only true counts as dispatched" do
+    controller = AccountsController.new
+    controller.set_request!(ActionDispatch::Request.new(Rack::MockRequest.env_for('/', StandardMCP::DISPATCHED_ENV => 'yes')))
+
+    refute controller.mcp_request?
+  end
+
+  test "mcp_request? is true for the instances the registry builds, so conditions and ACLs agree" do
+    assert instance_for(AccountsController).mcp_request?
+  end
+
+  test "an allow_mcp condition can ask whether the request is MCP's" do
+    request = ActionDispatch::Request.new(Rack::MockRequest.env_for('/'))
+
+    assert_equal [:index], StandardMCP::Registry.controller_for(McpOnlyAccountsController, request).mcp_actions_allowed
+    refute McpOnlyAccountsController.new.tap { |c| c.set_request!(request) }.mcp_request?
+  end
+
+  # --- model_attribute_definitions
+
+  test "model_attribute_definitions is StandardAPI's schemas_for by default, whatever the where" do
+    controller = instance_for(PropertiesController)
+
+    assert_equal controller.schemas_for(Property), controller.model_attribute_definitions(Property, nil)
+    assert_equal controller.schemas_for(Property), controller.model_attribute_definitions(Property, { 'size' => { 'gte' => 1 } })
+    assert_equal Property.attribute_names, controller.model_attribute_definitions(Property, nil).map { |d| d[:name] }
+  end
+
+  test "model_attribute_definitions goes through the ACL's schemas hook" do
+    controller = instance_for(McpWithheldPropertiesController)
+    rent = controller.model_attribute_definitions(Property, nil).find { |definition| definition[:name] == 'rent' }
+
+    assert_equal true, rent[:withheld]
   end
 
 end

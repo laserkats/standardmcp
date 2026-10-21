@@ -16,9 +16,11 @@ module StandardMCP
     end
 
     # A controller instance bound to +request+ so conditions can read
-    # `request`, `params`, `headers`. No action is dispatched.
+    # `request`, `params`, `headers`. No action is dispatched. It answers true to
+    # `mcp_request?`, as the controllers of dispatched requests do.
     def controller_for(klass, request)
       klass.new.tap do |controller|
+        controller.instance_variable_set(:@standard_mcp_request, true)
         previous = request.controller_instance
         controller.set_request!(request)
         # set_request! points the request at this throwaway instance.

@@ -32,13 +32,11 @@ class DescriptionTest < ActiveSupport::TestCase
     description = describe(PropertiesController, :index)
 
     assert_equal 'List properties. A real estate asset owned by an account. ' \
-      'Filter with where; page with limit and offset, using next_offset from the result. ' \
-      'Includes: account, photos. Order by: id, name, size, created_at.', description
+      'Filter with where; page with limit and offset, using next_offset from the result.', description
   end
 
-  test "show: action sentence, table comment, includes" do
-    assert_equal 'Get one account by id. A customer organization that owns properties. Includes: properties.',
-      describe(AccountsController, :show)
+  test "show: action sentence and table comment" do
+    assert_equal 'Get one account by id. A customer organization that owns properties.', describe(AccountsController, :show)
   end
 
   test "calculate: action sentence, table comment, guidance" do
@@ -47,67 +45,47 @@ class DescriptionTest < ActiveSupport::TestCase
       describe(AccountsController, :calculate)
   end
 
-  test "nested includes are listed by path" do
-    klass = Class.new(ApplicationController) do
-      def self.model = Account
-      def account_includes = [{ properties: [:photos] }]
-    end
-
-    description = StandardMCP::Description.for(StandardMCP::Registry.controller_for(klass, request_for), :show)
-
-    assert_includes description, 'Includes: properties, properties.photos.'
-  end
-
   test "the guidance does not repeat the schema" do
     description = describe(PropertiesController, :index)
 
     refute_match(/integer|minimum|maximum|boolean/, description)
   end
 
-  test "hidden associations are not listed" do
-    klass = Class.new(ApplicationController) do
-      def self.model = Property
-      def property_includes = [:account, :photos]
-      def property_excludes(_record) = { photos: true }
+  test "no description lists includes, orders or required attributes" do
+    %i[index show create update calculate].each do |action|
+      description = describe(PropertiesController, action)
+
+      refute_match(/Includes:|Order by:|Required:/, description, action.to_s)
+      %w[photos created_at].each { |name| refute_includes description, name, "#{action} names #{name}" }
     end
-
-    description = StandardMCP::Description.for(StandardMCP::Registry.controller_for(klass, request_for), :show)
-
-    assert_includes description, 'Includes: account.'
   end
 
-  test "orders and includes follow the caller" do
-    plain = describe(DescriptionVaryingController, :index)
-    admin = describe(DescriptionVaryingController, :index, 'X-Admin' => 'true')
-
-    assert_includes plain, 'Includes: account.'
-    assert_includes plain, 'Order by: id, name, size, created_at.'
-    assert_includes admin, 'Includes: account, photos.'
-    assert_includes admin, 'Order by: id, name, size, created_at, rent.'
+  test "descriptions don't change with the caller's orders and includes" do
+    assert_equal describe(DescriptionVaryingController, :index), describe(DescriptionVaryingController, :index, 'X-Admin' => 'true')
+    assert_equal describe(DescriptionVaryingController, :show), describe(DescriptionVaryingController, :show, 'X-Admin' => 'true')
   end
 
-  test "create: names the required attributes" do
-    assert_equal 'Create one property. A real estate asset owned by an account. Required: name. ' \
-      "#{StandardMCP::Description::IGNORED} Includes: account, photos. " \
-      'Full column details: describe {"resource": "properties"}.', describe(PropertiesController, :create)
-    assert_includes describe(ContactsController, :create), 'Required: name.'
-  end
-
-  test "create leaves out the required sentence when nothing is required" do
-    refute_includes describe(AccountsController, :create), 'Required'
+  test "create: ignored attributes, and where the writable and required ones are" do
+    assert_equal 'Create one property. A real estate asset owned by an account. ' \
+      "#{StandardMCP::Description::IGNORED} " \
+      'Writable and required attributes: describe_attributes {"resource": "properties"}.', describe(PropertiesController, :create)
+    assert_equal 'Create one contact. A person to reach at an account. ' \
+      "#{StandardMCP::Description::IGNORED} " \
+      'Writable and required attributes: describe_attributes {"resource": "contacts"}.', describe(ContactsController, :create)
   end
 
   test "update: send only what changes" do
     assert_equal 'Update one property by id. A real estate asset owned by an account. ' \
-      "Send only the attributes to change. #{StandardMCP::Description::IGNORED} Includes: account, photos. " \
-      'Full column details: describe {"resource": "properties"}.',
+      "Send only the attributes to change. #{StandardMCP::Description::IGNORED} " \
+      'Writable and required attributes: describe_attributes {"resource": "properties"}.',
       describe(PropertiesController, :update)
   end
 
-  test "the describe pointer is only there with the describe tool" do
-    StandardMCP.config.describe_tool = false
+  test "the describe pointer is only there with the describe tools" do
+    StandardMCP.config.describe_tools = false
 
-    refute_includes describe(PropertiesController, :create), 'describe'
+    assert_equal "Create one property. A real estate asset owned by an account. #{StandardMCP::Description::IGNORED}",
+      describe(PropertiesController, :create)
     refute_includes describe(PropertiesController, :update), 'describe'
     refute_includes describe(PropertiesController, :show), 'describe'
   end
@@ -117,11 +95,6 @@ class DescriptionTest < ActiveSupport::TestCase
       describe(ContactsController, :destroy)
   end
 
-  test "write includes follow the caller" do
-    assert_includes describe(DescriptionVaryingController, :create), 'Includes: account.'
-    assert_includes describe(DescriptionVaryingController, :update, 'X-Admin' => 'true'), 'Includes: account, photos.'
-  end
-
   test "unknown actions are rejected" do
     assert_raises(ArgumentError) { describe(AccountsController, :tables) }
   end
@@ -129,7 +102,7 @@ class DescriptionTest < ActiveSupport::TestCase
   test "a table without a comment leaves a clean description" do
     StandardMCP::Description.stubs(:table).returns(nil)
 
-    assert_equal 'Get one account by id. Includes: properties.', describe(AccountsController, :show)
+    assert_equal 'Get one account by id.', describe(AccountsController, :show)
   end
 
   test "action may be a string" do

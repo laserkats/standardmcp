@@ -95,7 +95,7 @@ class ToolsTest < ActiveSupport::TestCase
     names = list_tools.map { |t| t[:name] }
 
     assert_equal %w[
-      calculate_accounts describe get_account list_accounts
+      calculate_accounts describe_attributes describe_query get_account list_accounts
       get_property list_properties
     ].sort, names.sort
   end
@@ -295,6 +295,28 @@ class ToolsTest < ActiveSupport::TestCase
     assert_match(/limit/, tool_error('list_accounts', { limit: 6 }))
   end
 
+  test "a limit above max_limit is rejected by schema validation, whatever the controller allows" do
+    StandardMCP::Dispatcher.any_instance.expects(:call).never
+
+    assert_equal 100, tool('list_accounts')[:inputSchema][:properties][:limit][:maximum]
+    assert_match(/Invalid arguments.*limit/, tool_error('list_accounts', { limit: 101 }))
+  end
+
+  test "max_limit is the largest page, and nil leaves the controller's resource_limit" do
+    create_list(:account, 3)
+    StandardMCP.config.max_limit = 2
+
+    assert_equal 2, tool('list_accounts')[:inputSchema][:properties][:limit][:maximum]
+    assert_equal 2, structured('list_accounts', { limit: 2 })[:records].size
+    assert_match(/Invalid arguments.*limit/, tool_error('list_accounts', { limit: 3 }))
+    # The default page is held to it too.
+    assert_equal 2, structured('list_accounts')[:records].size
+
+    StandardMCP.config.max_limit = nil
+    assert_equal 1000, tool('list_accounts')[:inputSchema][:properties][:limit][:maximum]
+    assert_equal 3, structured('list_accounts', { limit: 500 })[:records].size
+  end
+
   test "list applies where, order and include" do
     account = create(:account, name: 'Acme')
     create(:account, name: 'Other')
@@ -455,12 +477,46 @@ class ToolsTest < ActiveSupport::TestCase
     assert_match(/Invalid arguments/, result[:content].first[:text])
   end
 
-  test "group_by with an unknown column is a tool error" do
-    assert_match(/Invalid arguments/, tool_error('calculate_accounts', { select: [{ count: '*' }], group_by: 'nope' }))
+  test "group_by with an unknown column is a tool error that points at describe_attributes" do
+    assert_equal 'Unknown attribute "nope" in group_by for accounts. Call describe_attributes {"resource": "accounts"} ' \
+      'to see the attributes.', tool_error('calculate_accounts', { select: [{ count: '*' }], group_by: 'nope' })
   end
 
   test "calculate of an unknown column is a tool error" do
-    assert_match(/Invalid arguments/, tool_error('calculate_accounts', { select: [{ sum: 'nope' }] }))
+    assert_match(/\AUnknown attribute "nope" in select for accounts\. Call describe_attributes/,
+      tool_error('calculate_accounts', { select: [{ sum: 'nope' }] }))
+  end
+
+  test "calculate checks the aggregates against the columns they take" do
+    assert_equal "sum can't be used on 'name'; it takes: id.", tool_error('calculate_accounts', { select: [{ sum: 'name' }] })
+    assert_equal "minimum doesn't take distinct.", tool_error('calculate_accounts', { select: [{ minimum: { distinct: 'name' } }] })
+    assert_equal "Unknown aggregate 'median' in select; use minimum, maximum, average, sum, count.",
+      tool_error('calculate_accounts', { select: [{ median: 'id' }] })
+    # StandardAPI would turn a dotted name into a model.
+    assert_match(/Unknown attribute "kernel.exit"/, tool_error('calculate_accounts', { select: [{ count: 'kernel.exit' }] }))
+    assert_match(/Unknown attribute "\*"/, tool_error('calculate_accounts', { select: [{ sum: '*' }] }))
+
+    create(:account)
+    assert_equal [1], structured('calculate_accounts', { select: [{ count: { distinct: 'name' } }] })[:result]
+  end
+
+  test "an unknown order key and an unknown include key are tool errors that point at describe_query" do
+    assert_match(/\AUnknown order key 'rent' for properties\. Call describe_query {"resource": "properties"} to see the keys you can order by\./,
+      tool_error('list_properties', { order: { rent: 'asc' } }))
+    assert_match(/\AUnknown include key 'nope' for properties\. Call describe_query {"resource": "properties"} to see the associations you can include\./,
+      tool_error('list_properties', { include: { nope: {} } }))
+    assert_match(/Unknown include key 'photos' for accounts/, tool_error('get_account', { id: create(:account).id, include: { photos: {} } }))
+  end
+
+  test "valid order and include are dispatched, with nesting left to StandardAPI" do
+    account = create(:account)
+    create(:property, account: account, name: 'B')
+    create(:property, account: account, name: 'A')
+
+    records = structured('list_properties', { order: { name: 'asc' }, include: { account: true } })[:records]
+
+    assert_equal %w[A B], records.map { |r| r[:name] }
+    assert_equal account.id, records.first.dig(:account, :id)
   end
 
   test "calculate without select is a tool error" do
@@ -539,8 +595,8 @@ class ToolsTest < ActiveSupport::TestCase
     StandardMCP.config.output_schema = true
     create(:property, account: create(:account))
 
-    # describe returns a document of its own, not a record.
-    assert(list_tools.reject { |t| t[:name] == 'describe' }.all? { |t| t[:outputSchema] })
+    # The describe tools return a document of their own, not a record.
+    assert(list_tools.reject { |t| t[:name].start_with?('describe_') }.all? { |t| t[:outputSchema] })
     assert_equal 1, structured('list_properties')[:records].size
   end
 
@@ -565,7 +621,34 @@ class ToolsTest < ActiveSupport::TestCase
     assert_equal %w[object array], where[:type]
     assert_equal %i[description type], where.keys.sort
     assert_equal where, tool('calculate_accounts')[:inputSchema][:properties][:where]
-    assert_includes where[:description], 'name (string): Display name of the organization.'
+    assert_includes where[:description], 'describe_query {"resource": "accounts"}'
+    refute_includes where[:description], 'Display name of the organization'
+  end
+
+  # Real columns of the test models that none of the examples in the shallow
+  # schemas use, so none may appear anywhere in tools/list.
+  COLUMN_NAMES = %w[
+    account_id property_id built_on listed_at metadata internal_path caption
+    created_at updated_at available
+  ].freeze
+
+  test "the shallow tools/list names no column of a model" do
+    # Output schemas, which are opt-in, describe the records.
+    StandardMCP.config.output_schema = false
+    StandardMCP::Registry.stubs(:controllers).returns(
+      [Admin::AccountsController, AccountsController, ContactsController, PhotosController, PropertiesController]
+    )
+    json = JSON.generate(list_tools(WRITES.merge('X-MCP-Admin' => 'true')))
+
+    COLUMN_NAMES.each { |name| refute_includes json, name, "tools/list names the column #{name}" }
+    # Nor an association or enum value: the keys are for describe_query.
+    %w[photos industrial retail].each { |name| refute_includes json, name, "tools/list names #{name}" }
+  end
+
+  test "deep mode does name the columns" do
+    StandardMCP.config.input_schema_depth = 'deep'
+
+    assert_includes JSON.generate(list_tools), 'built_on'
   end
 
   test "deep mode lists the typed where" do
@@ -596,20 +679,20 @@ class ToolsTest < ActiveSupport::TestCase
 
   test "bad filters are readable tool errors" do
     {
-      { foo: { eq: 1 } } => /\AUnknown column 'foo' for properties \(columns: id, account_id/,
+      { foo: { eq: 1 } } => /\AUnknown filter key 'foo' for properties\. Call describe_query {"resource": "properties"} with this where/,
       { size: { ilike: 'a%' } } => /\AUnsupported operator 'ilike' for size \(integer\)/,
       { size: { bogus: 1 } } => /\AUnsupported operator 'bogus' for size \(integer\)/,
       { size: { gte: 'abc' } } => /\AInvalid value for size: "abc" \(gte expects an integer\)/,
       { size: 5 } => /\Asize takes an operator object/,
       { kind: { eq: 'bogus' } } => /\AInvalid value for kind: "bogus"/,
-      { account: { nope: { eq: 1 } } } => /\AUnknown column 'nope' for accounts/,
+      { account: { nope: { eq: 1 } } } => /\AUnknown filter key 'nope' for accounts \(under account\)/,
       { account: 5 } => /\AThe filter on account must be an object/,
       [{ size: { eq: 1 } }, { size: { eq: 2 } }] => /must alternate filter objects/
     }.each do |where, expected|
       message = tool_error('list_properties', { where: where })
 
       assert_match expected, message, where.inspect
-      refute_match(/SELECT|WHERE|FROM|"properties"/, message, where.inspect)
+      refute_match(/SELECT|WHERE|FROM/, message, where.inspect)
     end
 
     assert_match(/Unsupported operator 'like' for id/, tool_error('calculate_accounts', { select: [{ count: '*' }], where: { id: { like: 'a' } } }))
@@ -624,7 +707,7 @@ class ToolsTest < ActiveSupport::TestCase
     assert result[:isError]
     text = result[:content].first[:text]
     assert_match(/Unsupported operator 'ilike' for id/, text)
-    assert_match(/Unknown column 'bogus' for accounts/, text)
+    assert_match(/Unknown filter key 'bogus' for accounts/, text)
     refute_match(/SELECT|WHERE|"accounts"|#{mine.id}/, text)
     assert_equal text, JSON.generate(result[:structuredContent])
   end
@@ -660,93 +743,182 @@ class ToolsTest < ActiveSupport::TestCase
 
   WRITES = { 'X-MCP-Writes' => 'true' }.freeze
 
-  def describe_enum(headers = {})
-    tool('describe', headers).dig(:inputSchema, :properties, :resource, :enum).sort
+  DESCRIBES = %w[describe_query describe_attributes].freeze
+
+  def describe_enum(headers = {}, name = 'describe_query')
+    tool(name, headers).dig(:inputSchema, :properties, :resource, :enum).sort
   end
 
-  test "describe takes a resource of the caller and is read-only" do
-    describe = tool('describe')
+  test "the describe tools take a resource and an optional where, and are read-only" do
+    DESCRIBES.each do |name|
+      describe = tool(name)
 
-    assert_equal 'Describe a resource', describe[:title]
-    assert_includes describe[:description], 'columns'
-    assert_includes describe[:description], 'enums'
-    assert_includes describe[:description], 'operators'
-    assert_includes describe[:description], 'associations'
-    assert_equal ['resource'], describe[:inputSchema][:required]
-    assert_equal false, describe[:inputSchema][:additionalProperties]
-    assert_equal 'string', describe[:inputSchema].dig(:properties, :resource, :type)
-    assert_equal({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-      describe[:annotations])
-    refute describe.key?(:outputSchema)
+      assert_equal ['resource'], describe[:inputSchema][:required], name
+      assert_equal false, describe[:inputSchema][:additionalProperties], name
+      assert_equal %i[resource where], describe[:inputSchema][:properties].keys, name
+      assert_equal 'string', describe[:inputSchema].dig(:properties, :resource, :type), name
+      assert_equal %w[object array], describe[:inputSchema].dig(:properties, :where, :type), name
+      assert_equal({ readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+        describe[:annotations], name)
+      refute describe.key?(:outputSchema), name
+    end
+  end
+
+  test "the describe tools say what they return" do
+    query = tool('describe_query')
+    attributes = tool('describe_attributes')
+
+    assert_equal 'Describe what a resource can be queried by', query[:title]
+    %w[keys operators associations].each { |word| assert_includes query[:description], word }
+    assert_equal 'Describe what a resource contains', attributes[:title]
+    ['JSON Schema', '"read"', '"write"', 'create and update', 'type', 'enum', 'default', 'readOnly', 'required']
+      .each { |word| assert_includes attributes[:description], word }
+    %w[writable withheld only_in].each { |word| refute_includes attributes[:description], word }
+  end
+
+  test "the where parameter is generic: it names no group" do
+    where = tool('describe_query')[:inputSchema].dig(:properties, :where, :description)
+
+    assert_includes where, 'The where you will use to list records'
+    assert_includes where, 'only_in'
+    assert_includes where, 'types'
+    refute_match(/librar/i, JSON.generate(list_tools))
+    assert_equal where, tool('describe_attributes')[:inputSchema].dig(:properties, :where, :description)
   end
 
   test "the describe enum is the resources of the caller" do
-    assert_equal %w[accounts properties], describe_enum
-    assert_equal %w[accounts contacts properties], describe_enum(WRITES)
-    assert_equal %w[accounts admin_accounts properties], describe_enum('X-MCP-Admin' => 'true')
+    DESCRIBES.each do |name|
+      assert_equal %w[accounts properties], describe_enum({}, name)
+      assert_equal %w[accounts contacts properties], describe_enum(WRITES, name)
+      assert_equal %w[accounts admin_accounts properties], describe_enum({ 'X-MCP-Admin' => 'true' }, name)
+    end
   end
 
   test "a resource of the caller is described as the schema resource describes it" do
-    result = call_tool('describe', { resource: 'properties' }, WRITES)
-    document = JSON.parse(JSON.generate(result[:structuredContent]))
+    request = request_for(WRITES)
+    entries = StandardMCP::Resources.entries(StandardMCP::Registry.allowed(request))
+    documents = {
+      'describe_query' => StandardMCP::Resources.document(request, entries, 'properties'),
+      'describe_attributes' => StandardMCP::Resources.attributes(request, entries, 'properties').structured_content
+    }
 
-    refute result[:isError]
-    assert_equal document, JSON.parse(result[:content].first[:text])
-    assert_equal 'properties', document['resource']
-    assert_equal document, StandardMCP::Resources.document(
-      request_for(WRITES), StandardMCP::Resources.entries(StandardMCP::Registry.allowed(request_for(WRITES))), 'properties'
-    )
-    assert document['columns'].any? { |c| c['writable'] }
+    documents.each do |name, resource|
+      result = call_tool(name, { resource: 'properties' }, WRITES)
+      document = JSON.parse(JSON.generate(result[:structuredContent]))
+
+      refute result[:isError]
+      assert_equal document, JSON.parse(result[:content].first[:text])
+      assert_equal JSON.parse(JSON.generate(resource)), document
+    end
+    assert_equal 'properties', structured('describe_query', { resource: 'properties' }, WRITES)[:resource]
+    assert_equal 'Property', structured('describe_attributes', { resource: 'properties' }, WRITES).dig(:read, :title)
+  end
+
+  test "describe_attributes is the schemas the read_schema and write_schema actions render" do
+    dispatcher = StandardMCP::Dispatcher.new(request_for(WRITES))
+    read = dispatcher.call(PropertiesController, :read_schema).json
+    write = dispatcher.call(PropertiesController, :write_schema).json
+
+    assert_equal({ 'read' => read, 'write' => write },
+      JSON.parse(JSON.generate(structured('describe_attributes', { resource: 'properties' }, WRITES))))
   end
 
   test "a namespaced resource is written with underscores" do
-    document = structured('describe', { resource: 'admin_accounts' }, 'X-MCP-Admin' => 'true')
+    document = structured('describe_query', { resource: 'admin_accounts' }, 'X-MCP-Admin' => 'true')
 
     assert_equal 'admin_accounts', document[:resource]
-    assert_equal %w[get_admin_account list_admin_accounts], document[:tools].sort
+    assert document.key?(:where)
+    assert_equal 'Account', structured('describe_attributes', { resource: 'admin_accounts' }, 'X-MCP-Admin' => 'true').dig(:read, :title)
   end
 
   test "a hidden resource is not in the enum and can't be described" do
-    refute_includes describe_enum, 'contacts'
-    refute_includes describe_enum, 'admin_accounts'
+    DESCRIBES.each do |name|
+      refute_includes describe_enum({}, name), 'contacts'
+      refute_includes describe_enum({}, name), 'admin_accounts'
 
-    assert_includes tool_error('describe', { resource: 'contacts' }), 'resource'
-    assert_includes tool_error('describe', { resource: 'admin_accounts' }), 'resource'
-    assert_includes tool_error('describe', { resource: 'photos' }), 'resource'
+      assert_includes tool_error(name, { resource: 'contacts' }), 'resource'
+      assert_includes tool_error(name, { resource: 'admin_accounts' }), 'resource'
+      assert_includes tool_error(name, { resource: 'photos' }), 'resource'
+    end
   end
 
-  test "describe isn't listed without a resource or with the tool switched off" do
+  test "a where is dispatched to read_schema and write_schema as params[:where]" do
+    where = { size: { gte: 1 } }
+    result = StandardMCP::Dispatcher::Result.new(status: 200, headers: {}, body: '{"title":"Property"}')
+    %i[read_schema write_schema].each do |action|
+      StandardMCP::Dispatcher.any_instance.expects(:call)
+        .with(PropertiesController, action, { 'where' => { 'size' => { 'gte' => 1 } } }).returns(result)
+    end
+
+    assert_equal({ read: { title: 'Property' }, write: { title: 'Property' } },
+      structured('describe_attributes', { resource: 'properties', where: where }, WRITES))
+  end
+
+  test "describe_attributes dispatches with no where when none is given, and never an include" do
+    result = StandardMCP::Dispatcher::Result.new(status: 200, headers: {}, body: '{"title":"Property"}')
+    %i[read_schema write_schema].each do |action|
+      StandardMCP::Dispatcher.any_instance.expects(:call).with(PropertiesController, action, {}).returns(result)
+    end
+
+    structured('describe_attributes', { resource: 'properties' }, WRITES)
+  end
+
+  test "a caller who can't write gets only the read schema, and no write_schema is dispatched" do
+    result = StandardMCP::Dispatcher::Result.new(status: 200, headers: {}, body: '{"title":"Property"}')
+    StandardMCP::Dispatcher.any_instance.expects(:call).with(PropertiesController, :read_schema, {}).returns(result)
+
+    assert_equal({ read: { title: 'Property' } }, structured('describe_attributes', { resource: 'properties' }))
+  end
+
+  test "a where that couldn't list is an error from either describe tool" do
+    error = tool_error('describe_query', { resource: 'properties', where: { nope: { eq: 1 } } })
+    assert_match(/\AUnknown filter key 'nope' for properties\. Call describe_query/, error)
+    assert tool_error('describe_attributes', { resource: 'properties', where: [{ size: { eq: 1 } }, { size: { eq: 2 } }] })
+      .include?('must alternate')
+  end
+
+  test "the describe tools aren't listed without a resource or with the tools switched off" do
     StandardMCP::Registry.stubs(:controllers).returns([PhotosController])
     assert_empty list_tools
 
     StandardMCP::Registry.stubs(:controllers).returns([AccountsController])
-    assert_includes list_tools.map { |t| t[:name] }, 'describe'
+    assert_equal DESCRIBES.sort, list_tools.map { |t| t[:name] }.grep(/\Adescribe/).sort
 
-    StandardMCP.config.describe_tool = false
-    refute_includes list_tools.map { |t| t[:name] }, 'describe'
+    StandardMCP.config.describe_tools = false
+    assert_empty list_tools.map { |t| t[:name] }.grep(/\Adescribe/)
   end
 
-  test "only builds describe when asked for it" do
+  test "only builds a describe tool when asked for it" do
     request = request_for
 
-    assert_equal %w[describe], StandardMCP::Tools.for(request, only: 'describe').map(&:name_value)
+    assert_equal %w[describe_query], StandardMCP::Tools.for(request, only: 'describe_query').map(&:name_value)
+    assert_equal %w[describe_attributes], StandardMCP::Tools.for(request, only: 'describe_attributes').map(&:name_value)
+    assert_empty StandardMCP::Tools.for(request, only: 'describe')
     assert_equal %w[list_accounts], StandardMCP::Tools.for(request, only: 'list_accounts').map(&:name_value)
     assert_empty StandardMCP::Tools.for(request, only: 'nothing')
   end
 
-  test "the shallow descriptions point at describe, with the resource name" do
+  test "the shallow descriptions point at the describe tools, with the resource name" do
     assert_includes tool('list_accounts')[:inputSchema].dig(:properties, :where, :description),
-      'Full column details: describe {"resource": "accounts"}.'
+      'describe_query {"resource": "accounts"}'
+    assert_includes tool('list_properties')[:inputSchema].dig(:properties, :order, :description),
+      'Orderable keys: describe_query {"resource": "properties"}.'
+    assert_includes tool('list_properties')[:inputSchema].dig(:properties, :include, :description),
+      'Includable associations: describe_query {"resource": "properties"}.'
     assert_includes tool('calculate_properties', WRITES)[:inputSchema].dig(:properties, :where, :description),
-      'describe {"resource": "properties"}'
+      'describe_query {"resource": "properties"}'
+    assert_includes tool('calculate_properties', WRITES)[:inputSchema].dig(:properties, :select, :description),
+      'Attribute names: describe_attributes {"resource": "properties"}.'
     assert_includes tool('list_admin_accounts', 'X-MCP-Admin' => 'true')[:inputSchema].dig(:properties, :where, :description),
-      'describe {"resource": "admin_accounts"}'
-    assert_includes tool('create_property', WRITES)[:description], 'Full column details: describe {"resource": "properties"}.'
-    assert_includes tool('update_property', WRITES)[:description], 'describe {"resource": "properties"}'
+      'describe_query {"resource": "admin_accounts"}'
+    assert_includes tool('create_property', WRITES)[:description],
+      'Writable and required attributes: describe_attributes {"resource": "properties"}.'
+    assert_includes tool('update_property', WRITES)[:inputSchema].dig(:properties, :property, :description),
+      'Writable and required attributes: describe_attributes {"resource": "properties"}.'
   end
 
   test "without describe nothing points at it" do
-    StandardMCP.config.describe_tool = false
+    StandardMCP.config.describe_tools = false
 
     refute_includes JSON.generate(list_tools(WRITES)), 'describe'
   end
@@ -757,20 +929,24 @@ class ToolsTest < ActiveSupport::TestCase
     refute_includes JSON.generate(tool('list_accounts')[:inputSchema]), 'describe'
   end
 
-  # Measured with the two controllers below; the limits leave about 10% room.
+  # Measured with the two controllers below (7,747 characters in all); the
+  # limits leave about 10% room.
   test "the shallow tools/list stays small" do
     StandardMCP.reset_config!
     StandardMCP::Registry.stubs(:controllers).returns([AccountsController, PropertiesController])
     tools = list_tools
     sizes = tools.to_h { |t| [t[:name], JSON.generate(t).size] }
 
-    assert_equal 6, tools.size
-    assert_operator JSON.generate(tool('list_accounts')[:inputSchema]).size, :<=, 2_950
-    assert_operator sizes['list_accounts'], :<=, 3_450
-    assert_operator sizes['list_properties'], :<=, 4_550
-    assert_operator sizes['calculate_accounts'], :<=, 3_250
-    assert_operator sizes['describe'], :<=, 550
-    assert_operator JSON.generate(tools).size, :<=, 13_900
+    assert_equal 7, tools.size
+    assert_operator JSON.generate(tool('list_accounts')[:inputSchema]).size, :<=, 1_400
+    assert_operator sizes['list_accounts'], :<=, 1_750
+    assert_operator sizes['list_properties'], :<=, 1_750
+    assert_operator sizes['calculate_accounts'], :<=, 1_400
+    assert_operator sizes['describe_query'], :<=, 950
+    assert_operator sizes['describe_attributes'], :<=, 1_050
+    assert_operator JSON.generate(tools).size, :<=, 8_500
+    # The width of a model doesn't change the size of its tools.
+    assert_in_delta sizes['list_accounts'], sizes['list_properties'], 50
   end
 
 end

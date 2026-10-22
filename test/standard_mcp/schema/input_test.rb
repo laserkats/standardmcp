@@ -50,17 +50,6 @@ class SchemaInputNoIncludesController < ApplicationController
   end
 end
 
-# Includes two levels deep, to show where_depth bounding the where nesting.
-class SchemaInputDeepController < ApplicationController
-  def self.model
-    Account
-  end
-
-  def account_includes
-    [{ properties: [:photos] }]
-  end
-end
-
 # Write schemas: attributes the ACL lists without a column, Hash entries,
 # per-request attributes, excludes and nested associations.
 class SchemaInputWritesController < ApplicationController
@@ -472,32 +461,83 @@ class SchemaInputTest < ActiveSupport::TestCase
     refute valid?(s, { property: { name: 'A', photos: nil } })
   end
 
-  test "shallow mode keeps the attributes typed and the association loose, described compactly" do
+  test "shallow mode is a loose record and a pointer, with no attribute named" do
     StandardMCP.config.input_schema_depth = 'shallow'
-    s = schema(PropertiesController, :create)
-    photos = s.dig('properties', 'property', 'properties', 'photos')
+    create = schema(PropertiesController, :create)
+    update = schema(PropertiesController, :update)
 
-    assert_equal({ 'type' => 'object' }, photos['items'])
-    assert_equal 'array', photos['type']
-    assert_includes photos['description'],
-      'Attributes: id, property_id (integer): The property this photo depicts; format (jpg|png|tiff): Image file format; caption (string).'
-    assert_equal ['integer', 'null'], s.dig('properties', 'property', 'properties', 'size', 'type')
-    assert_equal ['name'], s.dig('properties', 'property', 'required')
-
-    assert valid?(s, { property: { name: 'A', photos: [{ anything: 1 }] } })
-    refute valid?(s, { property: { name: 'A', photos: ['x'] } })
-    refute valid?(s, { property: { name: 'A', size: 'big' } })
+    assert_equal({ 'type' => 'object', 'description' => "The property's attributes. Writable and required attributes: " \
+      'describe_attributes {"resource": "properties"}.' }, create.dig('properties', 'property'))
+    assert_equal 1, update.dig('properties', 'property', 'minProperties')
+    assert_equal ['property'], create['required']
+    assert_equal %w[id property], update['required']
+    refute_includes JSON.generate(create), 'built_on'
+    assert valid?(create, { property: { anything: 1 } })
   end
 
-  test "shallow and deep agree on everything but the nested objects" do
-    shallow = nil
-    deep = schema(PropertiesController, :create)['properties']['property']['properties']
+  test "shallow mode keeps no key or attribute list in any tool schema" do
     StandardMCP.config.input_schema_depth = 'shallow'
-    shallow = schema(PropertiesController, :create)['properties']['property']['properties']
+    # (size and name are in the generic examples.)
+    names = %w[built_on listed_at metadata rent tags kind photos account_id internal_path]
+
+    %i[index show calculate create update destroy].each do |action|
+      json = JSON.generate(schema(PropertiesController, action))
+
+      names.each { |name| refute_includes json, name, "#{action} names #{name}" }
+    end
+  end
+
+  test "shallow order and include are loose objects with a pointer" do
+    StandardMCP.config.input_schema_depth = 'shallow'
+    properties = schema(PropertiesController, :index)['properties']
+
+    assert_equal 'object', properties['order']['type']
+    refute properties['order'].key?('properties')
+    assert_includes properties['order']['description'], '"asc" or "desc", or {"asc": "nulls_first"}'
+    assert_includes properties['order']['description'], 'Orderable keys: describe_query {"resource": "properties"}.'
+
+    assert_equal 'object', properties['include']['type']
+    refute properties['include'].key?('properties')
+    assert_includes properties['include']['description'], 'e.g. {"account": {}}'
+    assert_includes properties['include']['description'], 'checked against the associated resource'
+    assert_includes properties['include']['description'], 'Includable associations: describe_query {"resource": "properties"}.'
+    assert_equal properties['include'], schema(PropertiesController, :show)['properties']['include']
+    assert_equal properties['include'], schema(PropertiesController, :create)['properties']['include']
+  end
+
+  test "shallow calculate has loose select items and a string group_by, and keeps the one aggregate rule" do
+    StandardMCP.config.input_schema_depth = 'shallow'
+    s = schema(PropertiesController, :calculate)
+
+    assert_equal 'array', s.dig('properties', 'select', 'type')
+    assert_equal({ 'type' => 'object', 'minProperties' => 1 }, s.dig('properties', 'select', 'items'))
+    assert_includes s.dig('properties', 'select', 'description'), '[{"count": "*"}, {"maximum": "size"}, {"count": {"distinct": "name"}}]'
+    assert_includes s.dig('properties', 'select', 'description'), 'Attribute names: describe_attributes {"resource": "properties"}.'
+    assert_equal 'string', s.dig('properties', 'group_by', 'type')
+    refute s.dig('properties', 'group_by').key?('enum')
+
+    assert valid?(s, { 'select' => [{ 'count' => '*' }] })
+    assert valid?(s, { 'select' => [{ 'count' => '*' }], 'group_by' => 'kind' })
+    refute valid?(s, { 'select' => [{ 'count' => '*' }, { 'maximum' => 'size' }], 'group_by' => 'kind' })
+    refute valid?(s, { 'select' => [{ 'count' => '*', 'maximum' => 'size' }], 'group_by' => 'kind' })
+  end
+
+  test "without the describe tools the shallow schemas point nowhere" do
+    StandardMCP.config.input_schema_depth = 'shallow'
+    StandardMCP.config.describe_tools = false
+
+    %i[index show calculate create update].each do |action|
+      refute_includes JSON.generate(schema(PropertiesController, action)), 'describe', action.to_s
+    end
+  end
+
+  test "shallow and deep agree on everything but the record's attributes" do
+    deep = schema(PropertiesController, :create)['properties']
+    StandardMCP.config.input_schema_depth = 'shallow'
+    shallow = schema(PropertiesController, :create)['properties']
 
     assert_equal deep.keys, shallow.keys
-    assert_equal deep.except('photos'), shallow.except('photos')
-    assert_operator JSON.generate(deep).size, :>, JSON.generate(shallow).size
+    assert_operator JSON.generate(deep).size, :>, JSON.generate(shallow).size * 2
   end
 
   test "a nested belongs_to is an object or null, and its foreign key is taken even when the ACL doesn't list it" do
@@ -797,28 +837,28 @@ class SchemaInputTest < ActiveSupport::TestCase
   end
 
   test "where_depth 1 nests one association level" do
-    props = where_properties(schema(SchemaInputDeepController, :index))
+    props = where_properties(schema(AccountsController, :index))
 
     assert_includes props.keys, 'properties'
     assert_includes props['properties']['properties'].keys, 'name'
     refute_includes props['properties']['properties'].keys, 'photos'
   end
 
-  test "where_depth 2 nests two levels, bounded by the permitted includes" do
+  # StandardAPI checks an include against the associated model's own ACL and
+  # no longer lets an ACL nest one, so the include tree is one level and a
+  # deeper where_depth has nothing more to follow.
+  test "where_depth is bounded by the permitted includes, which are one level" do
+    one = schema(AccountsController, :index)
     StandardMCP.config.where_depth = 2
-    s = schema(SchemaInputDeepController, :index)
-    photos = where_properties(s)['properties']['properties']['photos']
+    two = schema(AccountsController, :index)
 
-    assert_includes photos['properties'].keys, 'caption'
-    refute_includes photos['properties'].keys, 'property'
-    assert valid?(s, { 'where' => { 'properties' => { 'photos' => { 'caption' => { 'eq' => 'x' } } } } })
-
+    assert_equal one, two
     StandardMCP.config.where_depth = 5
-    assert_equal s, schema(SchemaInputDeepController, :index)
+    assert_equal one, schema(AccountsController, :index)
   end
 
   test "where_depth 1 rejects a second level" do
-    s = schema(SchemaInputDeepController, :index)
+    s = schema(AccountsController, :index)
 
     refute valid?(s, { 'where' => { 'properties' => { 'photos' => { 'caption' => { 'eq' => 'x' } } } } })
   end
@@ -1016,13 +1056,51 @@ class SchemaInputTest < ActiveSupport::TestCase
 
   # --- limit, offset, distinct
 
-  test "limit defaults to the configured default and caps at resource_limit" do
+  test "limit defaults to the configured default and caps at max_limit and resource_limit" do
     limit = schema(AccountsController, :index)['properties']['limit']
 
     assert_equal 'integer', limit['type']
     assert_equal 1, limit['minimum']
-    assert_equal 1000, limit['maximum']
+    # resource_limit is 1000; the MCP page-size cap is smaller.
+    assert_equal 100, limit['maximum']
     assert_equal 25, limit['default']
+  end
+
+  test "max_limit is separate from resource_limit: the smaller of the two is the maximum" do
+    StandardMCP.config.max_limit = 500
+    assert_equal 500, schema(AccountsController, :index)['properties']['limit']['maximum']
+
+    StandardMCP.config.max_limit = 2000
+    assert_equal 1000, schema(AccountsController, :index)['properties']['limit']['maximum']
+
+    StandardMCP.config.max_limit = 5
+    assert_equal 5, schema(SchemaInputVaryingController, :index, 'X-Limit' => '8')['properties']['limit']['maximum']
+    assert_equal 3, schema(SchemaInputVaryingController, :index, 'X-Limit' => '3')['properties']['limit']['maximum']
+  end
+
+  test "max_limit holds the default page size too" do
+    StandardMCP.config.max_limit = 10
+    StandardMCP.config.default_limit = 50
+
+    limit = schema(AccountsController, :index)['properties']['limit']
+
+    assert_equal 10, limit['maximum']
+    assert_equal 10, limit['default']
+  end
+
+  test "a nil max_limit leaves the controller's resource_limit alone" do
+    StandardMCP.config.max_limit = nil
+
+    assert_equal 1000, schema(AccountsController, :index)['properties']['limit']['maximum']
+    # And with no resource_limit either, there is no maximum at all.
+    refute schema(SchemaInputPhotosController, :index)['properties']['limit'].key?('maximum')
+  end
+
+  test "max_limit caps a controller that has no resource_limit" do
+    limit = schema(SchemaInputPhotosController, :index)['properties']['limit']
+
+    assert_equal 100, limit['maximum']
+    assert_equal 10, limit['default']
   end
 
   test "limit default follows the configuration" do
@@ -1031,7 +1109,8 @@ class SchemaInputTest < ActiveSupport::TestCase
     assert_equal 50, schema(AccountsController, :index)['properties']['limit']['default']
   end
 
-  test "a controller's default_limit wins and a nil resource_limit drops the maximum" do
+  test "a controller's default_limit wins and a nil resource_limit leaves only max_limit" do
+    StandardMCP.config.max_limit = nil
     limit = schema(SchemaInputPhotosController, :index)['properties']['limit']
 
     assert_equal 10, limit['default']
@@ -1049,8 +1128,8 @@ class SchemaInputTest < ActiveSupport::TestCase
     s = schema(AccountsController, :index)
 
     refute_includes s['required'], 'limit'
-    assert valid?(s, { 'limit' => 1000 })
-    refute valid?(s, { 'limit' => 1001 })
+    assert valid?(s, { 'limit' => 100 })
+    refute valid?(s, { 'limit' => 101 })
     refute valid?(s, { 'limit' => 0 })
   end
 

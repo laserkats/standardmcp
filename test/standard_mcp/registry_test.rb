@@ -65,6 +65,21 @@ class RegistryTest< ActiveSupport::TestCase
     assert_kind_of Hash, controller.headers.to_h
   end
 
+  test "controller_for can set the params the controller reads" do
+    where = { 'size' => { 'gte' => 1 } }
+    controller = StandardMCP::Registry.controller_for(AccountsController, request_for, params: { 'where' => where })
+
+    assert_kind_of ActionController::Parameters, controller.params
+    assert_equal where, controller.params[:where].to_unsafe_h
+    assert_equal({ 'where' => where }, controller.params.to_unsafe_h)
+    assert_empty StandardMCP::Registry.controller_for(AccountsController, request_for).params.to_unsafe_h
+  end
+
+  test "controller_for builds instances that answer true to mcp_request?" do
+    assert StandardMCP::Registry.controller_for(AccountsController, request_for).mcp_request?
+    refute AccountsController.new.tap { |c| c.set_request!(request_for) }.mcp_request?
+  end
+
   test "controller_for leaves the request's controller_instance alone" do
     request = request_for
     request.controller_instance = :original

@@ -79,9 +79,11 @@ class OutputSchemaTest < ActiveSupport::TestCase
       assert_equal({ 'type' => 'array', 'items' => { 'type' => 'string' } },
         schema.dig('properties', 'ignored_attributes').slice('type', 'items'))
 
-      assert_valid schema, { record: { id: 1, name: 'Tower' } }
-      assert_valid schema, { record: { id: 1 }, ignored_attributes: ['size'] }
-      refute_valid schema, { record: { id: 1 }, ignored_attributes: [1] }
+      record = structured(PropertiesController, :show, { 'id' => create(:property).id })[:record]
+      assert_valid schema, { record: record }
+      assert_valid schema, { record: record, ignored_attributes: ['size'] }
+      refute_valid schema, { record: record, ignored_attributes: [1] }
+      refute_valid schema, { record: { id: 1 } }
       refute_valid schema, { ignored_attributes: [] }
     end
   end
@@ -144,14 +146,6 @@ class OutputSchemaTest < ActiveSupport::TestCase
     end
   end
 
-  test "ACL attributes mark the rest readOnly" do
-    properties = record_schema(PropertiesController)['properties']
-
-    assert_equal true, properties['id']['readOnly']
-    assert_equal true, properties['created_at']['readOnly']
-    refute properties['name'].key?('readOnly')
-  end
-
   test "permitted includes are described, nested" do
     properties = record_schema(PropertiesController)['properties']
 
@@ -175,21 +169,6 @@ class OutputSchemaTest < ActiveSupport::TestCase
     refute properties['properties']['items']['properties'].key?('account')
   end
 
-  test "excluded attributes are not advertised, in nested records too" do
-    photos = record_schema(PropertiesController).dig('properties', 'photos', 'items', 'properties')
-
-    assert photos.key?('caption')
-    refute photos.key?('internal_path')
-  end
-
-  test "records allow additional properties" do
-    schema = record_schema(PropertiesController)
-
-    assert_equal true, schema['additionalProperties']
-    assert_equal true, schema.dig('properties', 'photos', 'items', 'additionalProperties')
-    assert_equal true, schema.dig('properties', 'account', 'additionalProperties')
-  end
-
   test "nullable columns allow null and others do not" do
     properties = record_schema(PropertiesController)['properties']
 
@@ -202,43 +181,25 @@ class OutputSchemaTest < ActiveSupport::TestCase
     end
   end
 
-  test "only id is required" do
+  test "the columns are required and the includes are not, as a call picks its own" do
     schema = record_schema(PropertiesController)
 
-    assert_equal %w[id], schema['required']
-    assert_equal %w[id], schema.dig('properties', 'photos', 'items', 'required')
-    assert_equal %w[id], schema.dig('properties', 'account', 'required')
+    assert_equal Property.column_names, schema['required']
+    assert_equal Account.column_names, schema.dig('properties', 'account', 'required')
+    # PhotoACL has excludes, which can leave any column out.
+    assert_empty schema.dig('properties', 'photos', 'items', 'required')
   end
 
-  test "input-only keywords are removed" do
-    keywords = StandardMCP::Schema::Output::INPUT_ONLY_KEYWORDS
-    # `properties` maps names to schemas, so check each property schema.
-    # enum is re-added for Rails enums, which do bound output.
-    enums = Property.defined_enums.keys
-    check = ->(schema) do
-      schema['properties'].each do |name, property|
-        keywords.each do |k|
-          next if k == 'enum' && enums.include?(name)
-          refute property.key?(k), "#{k} left on #{name}"
-        end
-        check.call(property) if property.key?('properties')
-        check.call(property['items']) if property['items'].is_a?(Hash) && property['items'].key?('properties')
-      end
-    end
-    check.call(record_schema(PropertiesController))
-  end
-
-  test "rendering leaves the controller's includes alone" do
+  test "the record is what read_schema_for builds, with the includes optional and no $schema" do
     controller = controller_for(PropertiesController)
-    controller.instance_variable_set(:@includes, { 'marker' => {} })
+    includes = controller.send(:normalize_includes, controller.send(:includes_for, Property))
+    expected = controller.send(:read_schema_for, Property, includes)
 
-    StandardMCP::Schema::Output.for(controller, :show)
+    schema = record_schema(PropertiesController)
 
-    assert_equal({ 'marker' => {} }, controller.instance_variable_get(:@includes))
-
-    fresh = controller_for(PropertiesController)
-    StandardMCP::Schema::Output.for(fresh, :show)
-    refute fresh.instance_variable_defined?(:@includes)
+    refute schema.key?('$schema')
+    assert_equal expected['properties'], schema['properties']
+    assert_equal expected['required'] - %w[account photos], schema['required']
   end
 
   test "a controller without a model raises" do

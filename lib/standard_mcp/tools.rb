@@ -3,7 +3,8 @@ module StandardMCP
   # (controller, action), named from the controller path (index
   # `list_accounts`, show `get_account`, create `create_account`, update
   # `update_account`, destroy `delete_account`, calculate `calculate_accounts`),
-  # and a `describe` tool when the caller has any resource (see Resources).
+  # and the `describe_query` and `describe_attributes` tools when the caller has
+  # any resource (see Resources).
   #
   # Tools are built per request because the ACL-derived schemas and `if:`
   # conditions depend on the caller. Each tool closes over that request and
@@ -18,10 +19,11 @@ module StandardMCP
   # with two aggregates under group_by from reaching StandardAPI, which would
   # 500, so a server built from these tools must not switch it off.
   #
-  # The shallow `where` schema (the default) is a loose object, so a call's
-  # filter is checked against the model before it is dispatched
-  # (Schema::Where.errors) and a problem comes back as an `isError` result.
-  # With `input_schema_depth = 'deep'` the schema rejects bad filters itself.
+  # The shallow schemas (the default) are loose objects, so a call's `where`,
+  # `order` and `include` are checked against the model before it is
+  # dispatched (Schema::Where) and a problem comes back as an `isError` result
+  # that names the describe call to make. With `input_schema_depth = 'deep'` the
+  # schema rejects most of them itself, and the checks still run.
   module Tools
     ACTIONS = %i[index show create update destroy calculate].freeze
 
@@ -32,9 +34,34 @@ module StandardMCP
     # Actions on one record, named for its singular (`get_account`).
     SINGULAR = %i[show create update destroy].freeze
 
-    # The tool that returns Resources' schema document, for clients that can't
-    # read resources. Listed when the caller has any resource.
-    DESCRIBE = 'describe'.freeze
+    # The tools that return Resources' documents, for clients that can't read
+    # resources (and for a where the resource template can't take). Listed when
+    # the caller has any resource.
+    DESCRIBE_QUERY = 'describe_query'.freeze
+    DESCRIBE_ATTRIBUTES = 'describe_attributes'.freeze
+    DESCRIBES = [DESCRIBE_QUERY, DESCRIBE_ATTRIBUTES].freeze
+
+    DESCRIBE_TEXT = {
+      DESCRIBE_QUERY => {
+        title: 'Describe what a resource can be queried by',
+        description: 'Describe how to query a resource: the keys of where and order with their types and operators, ' \
+          'and the associations to include. Pass the same where you will list with.'
+      },
+      DESCRIBE_ATTRIBUTES => {
+        title: 'Describe what a resource contains',
+        description: "Describe a resource's records as JSON Schemas: \"read\" is a record as the list and get tools " \
+          'return it and, for callers who may write, "write" is what create and update accept (types, enums, defaults, ' \
+          'readOnly, required and validation constraints). Pass the where you will use so attributes that depend ' \
+          'on it are included.'
+      }
+    }.freeze
+
+    WHERE_PARAMETER = {
+      type: %w[object array],
+      description: 'Optional. The where you will use to list records, because some attributes and keys depend ' \
+        'on it. describe_query marks a key only_in the groups that have it, or with its types per group, ' \
+        'when the app says so.'
+    }.freeze
 
     # MCP spec: 1-64 characters. (The mcp gem allows 128.)
     MAX_NAME_LENGTH = 64
@@ -82,7 +109,9 @@ module StandardMCP
         duplicates = tools.group_by(&:name_value).select { |_, group| group.size > 1 }.keys
         raise Error, "Duplicate MCP tool names: #{duplicates.join(', ')}" if duplicates.any?
 
-        tools << describe_tool(request, allowed) if (only.nil? || only == DESCRIBE) && StandardMCP.config.describe_tool
+        if StandardMCP.config.describe_tools
+          DESCRIBES.each { |name| tools << describe_tool(request, allowed, name) if only.nil? || only == name }
+        end
         tools.compact
       end
 
@@ -99,7 +128,7 @@ module StandardMCP
       # on the tool class, so it can't reach private methods here.
       def run(request, klass, action, args, limit: nil, countable: false)
         args = (args || {}).to_h.deep_stringify_keys
-        errors = filter_errors(request, klass, args['where'])
+        errors = filter_errors(request, klass, action, args)
         return Response.error(errors.join('; '), errors: errors) if errors.any?
 
         dispatcher = Dispatcher.new(request)
@@ -120,34 +149,47 @@ module StandardMCP
         Response.not_allowed(action)
       end
 
-      # Runs one describe call: the schema document of resource +name+.
-      def describe(request, entries, name)
-        document = Resources.document(request, entries, name.to_s)
+      # Runs one describe call: the +tool+ ('describe_query' or
+      # 'describe_attributes') document of resource +name+ for +where+: the keys
+      # of the query, or the read and write JSON Schemas StandardAPI renders. A
+      # where that couldn't be used to list or calculate is an error, as it would
+      # be there.
+      def describe(request, entries, tool, name, where = nil)
+        where = JSON.parse(JSON.generate(where)) unless where.nil?
+
+        if tool == DESCRIBE_ATTRIBUTES
+          response = Resources.attributes(request, entries, name.to_s, where)
+          return response || Response.error("Unknown resource #{name.to_s.inspect}")
+        end
+
+        document = Resources.document(request, entries, name.to_s, where: where)
         return Response.error("Unknown resource #{name.to_s.inspect}") unless document
 
         MCP::Tool::Response.new([{ type: 'text', text: JSON.generate(document) }], structured_content: document)
+      rescue Schema::Where::Invalid => e
+        Response.error(e.message, errors: e.errors)
       end
 
       private
 
       # nil when the caller has no resource.
-      def describe_tool(request, allowed)
+      def describe_tool(request, allowed, name)
         entries = Resources.entries(allowed)
         return if entries.empty?
 
         MCP::Tool.define(
-          name: DESCRIBE,
-          title: 'Describe a resource',
-          description: 'Describe a resource: its columns with types, enums and filter operators, and its associations.',
+          name: name,
+          title: DESCRIBE_TEXT.fetch(name).fetch(:title),
+          description: DESCRIBE_TEXT.fetch(name).fetch(:description),
           input_schema: {
             type: 'object',
-            properties: { resource: { type: 'string', enum: entries.map(&:name) } },
+            properties: { resource: { type: 'string', enum: entries.map(&:name) }, where: WHERE_PARAMETER },
             required: ['resource'],
             additionalProperties: false
           },
           annotations: READ_ONLY
         ) do |server_context: nil, **args|
-          Tools.describe(request, entries, args[:resource])
+          Tools.describe(request, entries, name, args[:resource], args[:where])
         end
       end
 
@@ -194,13 +236,22 @@ module StandardMCP
         IgnoredAttributes.for(controller, model, record, submitted)
       end
 
-      # Problems with the call's `where` that the input schema didn't catch.
-      # A shallow schema leaves the filter loose, so it is checked against the
-      # model here; a deep one has already been validated by the server.
-      def filter_errors(request, klass, where)
-        return [] if where.nil? || StandardMCP.config.deep_input_schema?
+      # Problems with the call's `where`, `order`, `include` and, for a
+      # calculate, `select` and `group_by` that the input schema didn't catch: a
+      # shallow schema leaves them loose, and neither depth knows the ACL's
+      # operator lists or the definitions for the where.
+      def filter_errors(request, klass, action, args)
+        controller = Registry.controller_for(klass, request)
+        errors = Schema::Where.errors(controller, args['where']) +
+          Schema::Where.order_errors(controller, args['order']) +
+          Schema::Where.include_errors(controller, args['include']) +
+          Schema::Where.calculate_errors(controller, args['select'], args['group_by'])
 
-        Schema::Where.errors(Registry.controller_for(klass, request), where)
+        # The record of a write: a shallow schema leaves it loose.
+        if %i[create update].include?(action) && !StandardMCP.config.deep_input_schema?
+          errors += Schema::Attributes.errors(controller, action, args[klass.model.model_name.singular])
+        end
+        errors
       end
 
       # { offset:, next_offset:, total: } for a page. nil when the page didn't

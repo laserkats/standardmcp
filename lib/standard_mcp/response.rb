@@ -22,14 +22,20 @@ module StandardMCP
       calculate: :result
     }.freeze
 
+    # StandardAPI's `read_schema` and `write_schema` actions, which back
+    # `describe_attributes`. Not tools of their own, so they aren't among
+    # Controller::ACTIONS.
+    SCHEMA_ACTIONS = %i[read_schema write_schema].freeze
+
     class << self
       # `result` responds to #status, #headers, #body and #json (see
       # Dispatcher::Result). `extra` is merged into a successful result's
       # structured content, e.g. pagination for index.
       def from(result, action:, extra: nil)
         action = action.respond_to?(:to_sym) ? action.to_sym : action
-        unless Controller::ACTIONS.include?(action)
-          raise ArgumentError, "Unknown action #{action.inspect}. Valid actions: #{Controller::ACTIONS.map(&:inspect).join(', ')}"
+        actions = Controller::ACTIONS + SCHEMA_ACTIONS
+        unless actions.include?(action)
+          raise ArgumentError, "Unknown action #{action.inspect}. Valid actions: #{actions.map(&:inspect).join(', ')}"
         end
 
         status = result.status
@@ -51,12 +57,21 @@ module StandardMCP
         error("Action #{action} is not allowed")
       end
 
+      # A successful result holding +structured+ as it is, e.g. the schemas of
+      # `describe_attributes`, which come from more than one action.
+      def document(structured)
+        build(structured)
+      end
+
       private
 
       def success(result, action, extra)
         structured =
           if action == :destroy
             destroyed(result)
+          elsif SCHEMA_ACTIONS.include?(action)
+            # The JSON Schema itself, unwrapped.
+            payload(result, action)
           else
             { KEYS.fetch(action) => payload(result, action) }
           end

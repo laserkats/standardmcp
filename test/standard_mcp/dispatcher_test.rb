@@ -1,5 +1,64 @@
 require 'standard_mcp/test_helper'
 
+# Permits a filter key that is neither a column nor an association, which
+# StandardAPI's ACL check lets through to activerecord-filter.
+class DispatcherPhantomWhereController < ApplicationController
+  allow_mcp
+
+  def self.model
+    Property
+  end
+
+  def property_wheres
+    super + [:foo]
+  end
+end
+
+# Says whether the request it runs for is MCP's.
+class DispatcherFlagController < ApplicationController
+  allow_mcp only: [:index]
+
+  def self.model
+    Account
+  end
+
+  def index
+    render json: { mcp: mcp_request? }
+  end
+end
+
+# Records the where its ACL's schemas hook saw.
+class DispatcherSchemaController < ApplicationController
+  allow_mcp only: [:index, :update]
+
+  cattr_accessor :seen
+
+  def self.model
+    Property
+  end
+
+  def property_schemas(schemas)
+    self.class.seen = params[:where]&.to_unsafe_h
+    schemas
+  end
+end
+
+class DispatcherUpdateOnlyController < ApplicationController
+  allow_mcp only: [:update]
+
+  def self.model
+    Property
+  end
+end
+
+class DispatcherDestroyOnlyController < ApplicationController
+  allow_mcp only: [:destroy]
+
+  def self.model
+    Property
+  end
+end
+
 class DispatcherTest < ActiveSupport::TestCase
 
   def request_for(headers = {}, env = {})
@@ -155,6 +214,33 @@ class DispatcherTest < ActiveSupport::TestCase
     assert_equal 'sam', seen
   end
 
+  test "every dispatched request carries the dispatched flag" do
+    seen = nil
+    ActiveSupport::Notifications.subscribed(->(*, payload) { seen = payload[:headers][StandardMCP::DISPATCHED_ENV] }, 'process_action.action_controller') do
+      dispatch(AccountsController, :index, { 'limit' => 1 })
+    end
+
+    assert_equal true, seen
+    assert_equal 'standardmcp.dispatched', StandardMCP::DISPATCHED_ENV
+  end
+
+  test "dispatch_env can't drop or change the dispatched flag" do
+    seen = nil
+    StandardMCP.config.dispatch_env = ->(request) { { StandardMCP::DISPATCHED_ENV => false } }
+    ActiveSupport::Notifications.subscribed(->(*, payload) { seen = payload[:headers][StandardMCP::DISPATCHED_ENV] }, 'process_action.action_controller') do
+      dispatch(AccountsController, :index, { 'limit' => 1 })
+    end
+
+    assert_equal true, seen
+  end
+
+  test "the dispatched controller answers true to mcp_request?" do
+    assert_equal({ 'mcp' => true }, dispatch(DispatcherFlagController, :index).json)
+
+    StandardMCP.config.dispatch_env = ->(request) { { StandardMCP::DISPATCHED_ENV => nil } }
+    assert_equal({ 'mcp' => true }, dispatch(DispatcherFlagController, :index).json)
+  end
+
   # --- routing context
 
   test "path parameters, format and path are set" do
@@ -197,8 +283,8 @@ class DispatcherTest < ActiveSupport::TestCase
   end
 
   test "HTTP methods follow the action" do
-    assert_equal({ index: 'GET', show: 'GET', calculate: 'GET', create: 'POST', update: 'PATCH', destroy: 'DELETE' },
-      StandardMCP::Dispatcher::METHODS)
+    assert_equal({ index: 'GET', show: 'GET', calculate: 'GET', create: 'POST', update: 'PATCH', destroy: 'DELETE',
+      read_schema: 'GET', write_schema: 'GET' }, StandardMCP::Dispatcher::METHODS)
   end
 
   # --- writes
@@ -327,8 +413,93 @@ class DispatcherTest < ActiveSupport::TestCase
     assert dispatcher.allowed?(ContactsController, 'create')
     refute dispatcher.allowed?(ContactsController, :index)
     refute dispatcher.allowed?(PropertiesController, :destroy)
-    refute dispatcher.allowed?(ContactsController, :json_schema)
     refute StandardMCP::Dispatcher.new(request_for).allowed?(ContactsController, :create)
+  end
+
+  # --- read_schema and write_schema
+
+  test "read_schema renders the JSON Schema of a record" do
+    result = dispatch(AccountsController, :read_schema)
+
+    assert_equal 200, result.status
+    assert_equal 'Account', result.json['title']
+    assert_equal 'object', result.json['type']
+    assert_equal %w[id name status notes created_at updated_at errors], result.json['properties'].keys
+  end
+
+  test "write_schema renders the JSON Schema of the params of create and update" do
+    result = dispatch(ContactsController, :write_schema, {}, writes)
+
+    assert_equal 200, result.status
+    assert_equal 'Contact', result.json['title']
+    assert_equal ['contact'], result.json['properties'].keys
+  end
+
+  test "read_schema is allowed with any allowed action on the controller" do
+    assert StandardMCP::Dispatcher.new(request_for).allowed?(AccountsController, :read_schema)
+    assert StandardMCP::Dispatcher.new(request_for(writes)).allowed?(ContactsController, :read_schema)
+    # The schema is reachable by a caller who can only write.
+    assert_equal 200, dispatch(ContactsController, :read_schema, {}, writes).status
+  end
+
+  test "write_schema is allowed only with create or update on the controller" do
+    assert StandardMCP::Dispatcher.new(request_for(writes)).allowed?(ContactsController, :write_schema)
+    assert StandardMCP::Dispatcher.new(request_for(writes)).allowed?(PropertiesController, :write_schema)
+    assert StandardMCP::Dispatcher.new(request_for).allowed?(DispatcherUpdateOnlyController, :write_schema)
+
+    # Reads and a destroy don't write.
+    refute StandardMCP::Dispatcher.new(request_for).allowed?(AccountsController, :write_schema)
+    refute StandardMCP::Dispatcher.new(request_for).allowed?(PropertiesController, :write_schema)
+    refute StandardMCP::Dispatcher.new(request_for).allowed?(DispatcherDestroyOnlyController, :write_schema)
+    refute StandardMCP::Dispatcher.new(request_for).allowed?(ContactsController, :write_schema)
+  end
+
+  test "write_schema is refused for a read-only caller" do
+    error = assert_raises(StandardMCP::ActionNotAllowed) { dispatch(AccountsController, :write_schema) }
+    assert_equal 'write_schema is not allowed on AccountsController', error.message
+    assert_raises(StandardMCP::ActionNotAllowed) { dispatch(PropertiesController, :write_schema) }
+  end
+
+  test "the schema actions are refused for a controller the caller has no action on" do
+    %i[read_schema write_schema].each do |action|
+      refute StandardMCP::Dispatcher.new(request_for).allowed?(ContactsController, action)
+      refute StandardMCP::Dispatcher.new(request_for).allowed?(ApplicationController, action)
+    end
+
+    error = assert_raises(StandardMCP::ActionNotAllowed) { dispatch(ContactsController, :read_schema) }
+    assert_equal 'read_schema is not allowed on ContactsController', error.message
+  end
+
+  test "the schema actions re-check allow_mcp on every call" do
+    request = request_for(writes)
+    dispatcher = StandardMCP::Dispatcher.new(request)
+    assert_equal 200, dispatcher.call(ContactsController, :read_schema).status
+    assert_equal 200, dispatcher.call(ContactsController, :write_schema).status
+
+    request.headers['X-MCP-Writes'] = 'false'
+    assert_raises(StandardMCP::ActionNotAllowed) { dispatcher.call(ContactsController, :read_schema) }
+    assert_raises(StandardMCP::ActionNotAllowed) { dispatcher.call(ContactsController, :write_schema) }
+  end
+
+  test "write_schema takes no include" do
+    result = dispatch(ContactsController, :write_schema, { 'include' => { 'account' => true } }, writes)
+
+    assert_equal 200, result.status
+    assert_equal dispatch(ContactsController, :write_schema, {}, writes).json, result.json
+  end
+
+  test "read_schema and write_schema read the where from the params" do
+    %i[read_schema write_schema].each do |action|
+      DispatcherSchemaController.seen = nil
+
+      dispatch(DispatcherSchemaController, action, { 'where' => { 'account_id' => 1 } })
+
+      assert_equal({ 'account_id' => 1 }, DispatcherSchemaController.seen, action.to_s)
+    end
+  end
+
+  test "an action that is not one of the actions or the schema actions is not allowed" do
+    refute StandardMCP::Dispatcher.new(request_for).allowed?(AccountsController, :tables)
   end
 
   # --- StandardAPI error responses
@@ -391,10 +562,18 @@ class DispatcherTest < ActiveSupport::TestCase
   # A filter the model-level check (Schema::Where) would have caught reaches
   # activerecord-filter or Postgres when it is dispatched directly.
   test "an unknown filter column is a 400 Result" do
-    result = dispatch(PropertiesController, :index, { 'where' => { 'foo' => { 'eq' => 1 } }, 'limit' => 1 })
+    result = dispatch(DispatcherPhantomWhereController, :index, { 'where' => { 'foo' => { 'eq' => 1 } }, 'limit' => 1 })
 
     assert_equal 400, result.status
     assert_equal({ 'error' => "where names a column or association that doesn't exist" }, result.json)
+  end
+
+  # StandardAPI checks every where against the ACL's wheres before filtering.
+  test "a filter the ACL wheres don't permit is a 400 Result" do
+    result = dispatch(PropertiesController, :index, { 'where' => { 'foo' => { 'eq' => 1 } }, 'limit' => 1 })
+
+    assert_equal 400, result.status
+    assert_match(/foo/, result.body)
   end
 
   test "an unsupported filter operator is a 400 Result" do

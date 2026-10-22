@@ -1,11 +1,13 @@
+require 'json_schemer'
+
 module StandardMCP
   module Schema
     # The record a write tool sends, as StandardAPI will accept it: the
     # attributes the ACL permits (`model_attributes`), typed from the columns,
     # plus the associations the ACL lets a request write through (`nested`).
     #
-    # StandardAPI's json_schema view derives the same from validators and
-    # nullability, but it describes a stored record; this is the INPUT side, so
+    # StandardAPI's write_schema derives the same from the definitions and
+    # validators, for describe_attributes to show; this one checks the call, so
     # only what is safe to enforce before saving is kept:
     #
     # - unconditional validators only (no `if:`/`unless:`, and `on:` must match
@@ -125,6 +127,22 @@ module StandardMCP
           schema
         end
 
+        # Why +record+ (the attributes of a create or update, String-keyed)
+        # can't be saved, as messages for the agent; empty when it can. The
+        # shallow tool schema leaves the record loose, so this holds it to the
+        # typed schema a call at a time: a key the ACL doesn't permit, a value of
+        # the wrong type or outside an enum, a missing required attribute.
+        # Without it a bad enum value or a nested record that isn't an object
+        # would be a server error, and a wrong number a silent 0.
+        def errors(controller, action, record)
+          return [] unless record.is_a?(Hash)
+
+          messages = JSONSchemer.schema(schema(controller, controller.class.model, action)).validate(record).map { |error| error['error'] }.uniq
+          call = Description.describe_call(controller, 'describe_attributes')
+          messages[-1] = "#{messages.last}. Writable and required attributes: #{call}." if messages.any? && call
+          messages
+        end
+
         # "name (string): Marketing name.", for each attribute a nested record
         # may carry; the shallow schema's stand-in for typing them.
         def lines(controller, model)
@@ -136,7 +154,7 @@ module StandardMCP
             column = model.columns_hash[name]
             next if column && !writable?(model, column, :nested)
 
-            line = column ? "#{name} (#{Where.label(model, column)})" : name
+            line = column ? "#{name} (#{Input.column_label(model, column)})" : name
             comment = Description.column(model, name)&.delete_suffix('.')
             comment ? "#{line}: #{comment}" : line
           end
@@ -342,9 +360,6 @@ module StandardMCP
             { 'description' => description }.merge(Input.nullable(object))
           end
         end
-
-        # Shared with Schema::Document, which flags the writable columns.
-        public :writable?
       end
     end
   end

@@ -5,25 +5,17 @@ module StandardMCP
     # JSON Schema for the `structuredContent` a tool returns, matching the
     # wrapping StandardMCP::Response applies.
     #
-    # The record schema is StandardAPI's own `json_schema` view, rendered for
-    # the caller's controller so the table/column comments, ACL readOnly marks
-    # and every permitted include come from the one builder StandardAPI already
-    # has. It is then adapted for output: StandardAPI's schema describes what
-    # a valid *input* looks like, so constraints that only make sense for input
-    # are removed rather than risk rejecting a real response.
+    # The record schema is StandardAPI's `read_schema_for`, built on the
+    # caller's controller, so the comments, nullability and every permitted
+    # include come from the one builder StandardAPI already has. It describes
+    # a record as `show` and `index` render it, so it is used as it is, apart
+    # from the includes no longer being required (see optional_includes).
     module Output
-      # Keywords StandardAPI derives from validators and column defaults. They
-      # describe valid input, and legacy rows need not satisfy them.
-      INPUT_ONLY_KEYWORDS = %w[
-        default const pattern minLength maxLength
-        minimum maximum exclusiveMinimum exclusiveMaximum enum
-      ].freeze
-
       module_function
 
       # +controller+ is an instance from Registry.controller_for, so ACL
-      # methods resolve for the caller. Not cached: each call renders the
-      # view, so build once per request and reuse.
+      # methods resolve for the caller. Not cached: each call builds the
+      # schema, so build once per request and reuse.
       def for(controller, action)
         action = action.to_sym
         case action
@@ -42,8 +34,24 @@ module StandardMCP
         model = controller.class.model
         raise ArgumentError, "#{controller.class} has no model" unless model
 
-        includes = StandardAPI::Includes.normalize(controller.send(:model_includes))
-        adapt(render(controller, includes), model, controller, nil)
+        includes = controller.send(:normalize_includes, controller.send(:includes_for, model))
+        schema = controller.send(:read_schema_for, model, includes)
+        # Embedded in the tool's schema, which has its own.
+        schema.delete('$schema')
+        optional_includes(schema, includes)
+      end
+
+      # read_schema describes a record rendered with exactly these includes, so
+      # it requires them. A call picks its own, so none is required (the
+      # associations stay described for when it asks for them).
+      def optional_includes(schema, includes)
+        includes.each do |name, nested|
+          property = schema.dig('properties', name.to_s) or next
+
+          schema['required'] = schema['required'] - [name.to_s] if schema['required']
+          optional_includes(property['items'] || property, nested) if nested.is_a?(Hash)
+        end
+        schema
       end
 
       def index(record)
@@ -100,94 +108,6 @@ module StandardMCP
           },
           'required' => %w[result]
         }
-      end
-
-      # Renders StandardAPI's json_schema template in +controller+ itself, so
-      # the view sees the caller's ACL (`controller.model_attributes`) and
-      # whichever handler (jbuilder or turbostreamer) the app has. Dispatching
-      # the `json_schema` action instead would have to bypass Dispatcher's
-      # allow_mcp check, and `ApplicationController.renderer` has no caller.
-      def render(controller, includes)
-        had_includes = controller.instance_variable_defined?(:@includes)
-        previous = controller.instance_variable_get(:@includes)
-        controller.instance_variable_set(:@includes, includes)
-
-        JSON.parse(controller.render_to_string(template: 'application/json_schema', formats: [:json], layout: false))
-      ensure
-        if had_includes
-          controller.instance_variable_set(:@includes, previous)
-        else
-          controller.remove_instance_variable(:@includes) if controller.instance_variable_defined?(:@includes)
-        end
-      end
-
-      # Turns an input schema into an output one, in place, walking the model
-      # alongside it to find each property's column or association.
-      def adapt(schema, model, controller, inherited)
-        excluded = StandardAPI::Excludes.deep_merge(probe_excludes(controller, model), inherited)
-        properties = schema['properties']
-
-        # Only `id` is guaranteed; StandardAPI's `required` is for input.
-        schema.delete('required')
-        schema['required'] = %w[id] if properties.key?('id')
-        # Serializers and custom partials may add keys.
-        schema['additionalProperties'] = true
-
-        properties.keys.each do |name|
-          if excluded[name] == true
-            properties.delete(name)
-          elsif (column = model.columns_hash[name])
-            adapt_column(properties[name], model, column)
-          elsif (association = model.reflect_on_association(name))
-            sub = excluded[name] if excluded[name].is_a?(Hash)
-            if association.collection?
-              adapt(properties[name]['items'], association.klass, controller, sub)
-            else
-              adapt(properties[name], association.klass, controller, sub)
-              nullable!(properties[name])
-            end
-          end
-        end
-
-        schema
-      end
-
-      def adapt_column(property, model, column)
-        target = column.array && property['items'] ? property['items'] : property
-        [property, target].uniq.each { |s| s.except!(*INPUT_ONLY_KEYWORDS) }
-        # The view nests an array column's whole schema, comment included,
-        # under items; the comment describes the column.
-        if !target.equal?(property) && target.key?('description')
-          property['description'] ||= target.delete('description')
-        end
-
-        # BigDecimal serializes as a string; accept either form.
-        target['type'] = %w[number string] if column.type == :decimal
-        # json columns hold any JSON value, not only objects.
-        target.delete('type') if %i[json jsonb].include?(column.type)
-
-        if (labels = model.defined_enums[column.name]&.keys)
-          target['enum'] = column.null ? labels + [nil] : labels
-        end
-
-        nullable!(property) if column.null
-      end
-
-      def nullable!(schema)
-        return unless schema['type']
-
-        schema['type'] = (Array(schema['type']) | %w[null])
-      end
-
-      # Excludes are resolved per record, so the view can't apply them and a
-      # blank record stands in. The result is only a hint: it can miss a
-      # record-dependent exclude, which is why records allow additional
-      # properties and nothing here is `required`. An ACL that can't answer
-      # for a blank record gets no pruning.
-      def probe_excludes(controller, model)
-        controller.send(:excludes, model.new)
-      rescue StandardError
-        nil
       end
     end
   end

@@ -8,8 +8,8 @@ module StandardMCP
   #   same per-request hiding as the tools), carrying the table comment and the
   #   names of its tools;
   # - a short paragraph covers the conventions the tools share, so the tool
-  #   descriptions needn't repeat them. Operators and columns stay in each
-  #   tool's `where` description, which keeps every tool self-contained.
+  #   descriptions needn't repeat them. Keys, operators and attributes are not
+  #   listed: the describe tools return them, on request.
   #
   # `config.instructions` changes that: false sends none, a String or a callable
   # taking the request replaces the generated text, and a callable taking the
@@ -93,12 +93,15 @@ module StandardMCP
         "Resources:\n#{lines.join("\n")}"
       end
 
-      # The resource names of the `describe` tool are the listed ones with `/`
-      # written as `_` (the segment the tool names use).
+      # The resource names of the describe tools are the listed ones with `/`
+      # written as `_` (the segment the tool names use). Neither is required
+      # before a call; they say what the keys, operators and attributes are.
       def describe_sentence(resources)
-        sentence = %(describe {"resource": "#{resources.first.name.tr('/', '_')}"} returns a resource's ) +
-          'columns, types, enums, operators and associations'
-        sentence += ' (write a "/" in its name as "_")' if resources.any? { |resource| resource.name.include?('/') }
+        name = resources.first.name.tr('/', '_')
+        sentence = %(describe_query {"resource": "#{name}"} returns the keys, operators and associations of where, order ) +
+          %(and include; describe_attributes {"resource": "#{name}"} returns the JSON Schema of a record and, for writers, of the params of create and update (which attributes are read only or required). ) +
+          'Pass them the where you will use, as some keys depend on it'
+        sentence += ' (write a "/" in a resource name as "_")' if resources.any? { |resource| resource.name.include?('/') }
         "#{sentence}."
       end
 
@@ -108,11 +111,10 @@ module StandardMCP
         sentences = []
         sentences << 'list_* tools return one page; pass the result\'s next_offset as offset to get the next.' if actions.include?(:index)
         if (actions & %i[index calculate]).any?
-          sentences << 'Filters (where) take operator objects such as {"size": {"gte": 1000}}; ' \
-            "a tool's where description lists its columns and operators."
+          sentences << 'Filters (where) take operator objects such as {"size": {"gte": 1000}}.'
         end
         sentences << 'include embeds associations in the result.' if (actions & %i[index show create update]).any?
-        sentences << describe_sentence(resources) if StandardMCP.config.describe_tool
+        sentences << describe_sentence(resources) if StandardMCP.config.describe_tools
 
         writer = resources.find { |resource| (resource.actions & %i[create update]).any? }
         if writer

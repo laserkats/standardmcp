@@ -16,14 +16,19 @@ module StandardMCP
     end
 
     # A controller instance bound to +request+ so conditions can read
-    # `request`, `params`, `headers`. No action is dispatched.
-    def controller_for(klass, request)
+    # `request`, `params`, `headers`. No action is dispatched. It answers true to
+    # `mcp_request?`, as the controllers of dispatched requests do. +params+
+    # replaces the request's parameters (String-keyed, e.g. `{ 'where' => ... }`),
+    # for code that reads `params[:where]` the way a dispatched call would see it.
+    def controller_for(klass, request, params: nil)
       klass.new.tap do |controller|
+        controller.instance_variable_set(:@standard_mcp_request, true)
         previous = request.controller_instance
         controller.set_request!(request)
         # set_request! points the request at this throwaway instance.
         request.controller_instance = previous
         controller.set_response!(klass.make_response!(request))
+        controller.params = ActionController::Parameters.new(params) if params
       end
     end
 

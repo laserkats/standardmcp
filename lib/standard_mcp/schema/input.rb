@@ -59,7 +59,7 @@ module StandardMCP
         # ({ 'properties' => { 'photos' => {} } }). Associations that an ACL
         # `excludes` hides are dropped, as are StandardAPI's reserved keys.
         def includes(controller)
-          tree = StandardAPI::Includes.normalize(controller.send(:model_includes))
+          tree = controller.send(:normalize_includes, controller.send(:includes_for, controller.class.model))
           prune_includes(controller, controller.class.model, tree)
         end
 
@@ -67,7 +67,7 @@ module StandardMCP
         # through an association ({ 'account' => ['name'] }). Hidden columns are
         # dropped.
         def orders(controller)
-          prune_orders(controller, controller.class.model, controller.send(:model_orders))
+          prune_orders(controller, controller.class.model, controller.send(:orders_for, controller.class.model))
         end
 
         # Column and association names an ACL `excludes` removes from every
@@ -86,19 +86,23 @@ module StandardMCP
         def index(controller)
           model = controller.class.model
           tree = includes(controller)
-          sorts = order_properties(model, orders(controller))
+          permit = orders(controller)
           defs = {}
           properties = { 'where' => where_property(controller, model, tree, defs) }
-          if sorts.any?
-            defs['direction'] = direction_schema
-            properties['order'] = {
-              'type' => 'object',
-              'properties' => sorts,
-              'additionalProperties' => false,
-              'description' => 'Sort order, keyed by column. Keys apply in the order given.'
-            }
+          if permit.any?
+            if deep?
+              defs['direction'] = direction_schema
+              properties['order'] = {
+                'type' => 'object',
+                'properties' => order_properties(model, permit),
+                'additionalProperties' => false,
+                'description' => 'Sort order, keyed by column. Keys apply in the order given.'
+              }
+            else
+              properties['order'] = order_property(controller)
+            end
           end
-          properties['include'] = include_schema(model, tree) if tree.any?
+          properties['include'] = include_property(controller, model, tree) if tree.any?
           properties['limit'] = limit_schema(controller)
           properties['offset'] = { 'type' => 'integer', 'minimum' => 0, 'description' => 'Number of records to skip.' }
           properties['distinct'] = {
@@ -113,24 +117,31 @@ module StandardMCP
           model = controller.class.model
           tree = includes(controller)
           properties = { 'id' => id_schema(model) }
-          properties['include'] = include_schema(model, tree) if tree.any?
+          properties['include'] = include_property(controller, model, tree) if tree.any?
 
           root(properties, ['id'])
         end
 
         def calculate(controller)
           model = controller.class.model
-          hide = hidden(controller, model)
-          columns = model.columns.reject { |c| hide.include?(c.name) }
           defs = {}
-          properties = {
-            'where' => where_property(controller, model, includes(controller), defs),
-            'select' => select_schema(columns),
-            'group_by' => {
+          properties = { 'where' => where_property(controller, model, includes(controller), defs) }
+
+          if deep?
+            hide = hidden(controller, model)
+            columns = model.columns.reject { |c| hide.include?(c.name) }
+            properties['select'] = select_schema(columns)
+            properties['group_by'] = {
               'enum' => columns.reject { |c| ungroupable?(c) }.map(&:name),
               'description' => 'Column to group by; the result is then keyed by its value. Takes a single aggregate in select.'
             }
-          }
+          else
+            properties['select'] = loose_select_schema(controller)
+            properties['group_by'] = {
+              'type' => 'string',
+              'description' => 'Attribute to group by; the result is then keyed by its value. Takes a single aggregate in select.'
+            }
+          end
 
           # StandardAPI builds the grouped result with Hash[[key, value], ...],
           # so a second aggregate raises (a 500) instead of failing validation.
@@ -152,8 +163,8 @@ module StandardMCP
           key = model.model_name.singular
           properties = {}
           properties['id'] = id_schema(model) if action == :update
-          properties[key] = Attributes.schema(controller, model, action)
-          properties['include'] = include_schema(model, tree) if tree.any?
+          properties[key] = deep? ? Attributes.schema(controller, model, action) : loose_record_schema(controller, model, action)
+          properties['include'] = include_property(controller, model, tree) if tree.any?
 
           root(properties, action == :update ? ['id', key] : [key])
         end
@@ -168,12 +179,67 @@ module StandardMCP
           schema
         end
 
+        def deep?
+          StandardMCP.config.deep_input_schema?
+        end
+
+        # --- shallow properties: loose objects and a pointer to the describe
+        # tools, so no key or attribute list is in tools/list
+
+        # " Orderable keys: describe_query {...}." (or nothing without the
+        # describe tools), for a description that ends with what it points to.
+        def pointer(controller, label, tool)
+          call = Description.describe_call(controller, tool)
+          " #{label}: #{call}." if call
+        end
+
+        def order_property(controller)
+          {
+            'type' => 'object',
+            'description' => 'Sort order keyed by attribute, applied in the order given: "asc" or "desc", ' \
+              'or {"asc": "nulls_first"} / {"desc": "nulls_last"} to place NULLs.' +
+              pointer(controller, 'Orderable keys', 'describe_query').to_s
+          }
+        end
+
+        def include_property(controller, model, tree)
+          return include_schema(model, tree) if deep?
+
+          name = tree.keys.first
+          {
+            'type' => 'object',
+            'description' => "Associations to embed in each record, e.g. {\"#{name}\": {}}; nest to include deeper, " \
+              "e.g. {\"#{name}\": {\"<association>\": {}}}, which is checked against the associated resource." +
+              pointer(controller, 'Includable associations', 'describe_query').to_s
+          }
+        end
+
+        def loose_select_schema(controller)
+          {
+            'type' => 'array',
+            'minItems' => 1,
+            'items' => { 'type' => 'object', 'minProperties' => 1 },
+            'description' => 'Aggregates to compute, e.g. [{"count": "*"}, {"maximum": "size"}, {"count": {"distinct": "name"}}].' +
+              pointer(controller, 'Attribute names', 'describe_attributes').to_s
+          }
+        end
+
+        def loose_record_schema(controller, model, action)
+          schema = {
+            'type' => 'object',
+            'description' => "The #{model.model_name.human.downcase}'s attributes." +
+              pointer(controller, 'Writable and required attributes', 'describe_attributes').to_s
+          }
+          schema['minProperties'] = 1 if action == :update
+          schema
+        end
+
         # --- where
 
         # The `where` property for the configured depth. In deep mode the typed
         # filter is registered in +defs+ (the property refers to it).
         def where_property(controller, model, tree, defs)
-          return Where.schema(controller, model, tree) unless StandardMCP.config.deep_input_schema?
+          return Where.schema(controller) unless deep?
 
           defs['where'] = where_object(controller, model, tree, defs)
           where_schema
@@ -197,14 +263,23 @@ module StandardMCP
 
         # +depth+ is how many association levels may still nest below this
         # model (Configuration#where_depth at the top).
+        #
+        # Only what the model's ACL `wheres` permit is offered: the columns it
+        # lists (with the operators it lists for them), its `filter_on` filters
+        # (untyped), and an association that is permitted by name and in the
+        # include tree.
         def where_object(controller, model, tree, defs, depth = StandardMCP.config.where_depth.to_i)
-          hidden = hidden(controller, model)
+          permits = Query.permits(controller, model)
           properties = {}
 
           model.columns.each do |column|
-            next if hidden.include?(column.name)
+            next unless permits.key?(column.name)
 
-            properties[column.name] = column_filter(model, column, defs)
+            properties[column.name] = column_filter(controller, model, column, defs, permits[column.name])
+          end
+
+          permits.each_key do |name|
+            properties[name] = {} if model.filters.key?(name) && !properties.key?(name)
           end
 
           tree.each do |name, subtree|
@@ -212,7 +287,7 @@ module StandardMCP
 
             reflection = model.reflect_on_association(name)
             klass = klass_for(reflection)
-            next if klass.nil? || reflection.polymorphic? || properties.key?(name)
+            next if klass.nil? || reflection.polymorphic? || properties.key?(name) || !permits.key?(name)
 
             description = association_description(model, reflection)
             object = where_object(controller, klass, subtree, defs, depth - 1)
@@ -242,17 +317,31 @@ module StandardMCP
         # of the same type are identical apart from the comment, so they are
         # shared through $defs (one per type, e.g. integer_filter). An enum
         # column instead gets its own filter with the values inline.
-        def column_filter(model, column, defs)
+        #
+        # +permitted+ is what the ACL's `wheres` allow on the column: :all, or
+        # the operators it lists, which the filter is narrowed to (a narrowed
+        # filter is shared only with columns narrowed the same way).
+        def column_filter(controller, model, column, defs, permitted = :all)
           schema = {}
           comment = Description.column(model, column.name)
           schema['description'] = comment if comment
 
           values = allowed_values(model, column)
-          return schema.merge(enum_filter(values)) if values
+          if values
+            filter = enum_filter(values)
+            filter['properties'] = narrow(controller, filter['properties'], permitted)
+            return schema.merge(filter)
+          end
 
           kind = column_kind(column)
           value = value_schema(column)
-          schema.merge('$ref' => "#/$defs/#{define(defs, filter_name(kind, column, value), type_filter(kind, value))}")
+          filter = type_filter(kind, value, controller, permitted)
+          schema.merge('$ref' => "#/$defs/#{define(defs, filter_name(kind, column, value), filter)}")
+        end
+
+        # +operators+ (name => value schema) held to the ACL's list.
+        def narrow(controller, operators, permitted)
+          operators.slice(*Query.allowed_operators(controller, operators.keys, permitted))
         end
 
         # The operators (String-keyed, each mapped to the schema of its value) a
@@ -297,8 +386,10 @@ module StandardMCP
           end
         end
 
-        def type_filter(kind, value)
-          { 'type' => 'object', 'additionalProperties' => false, 'minProperties' => 1, 'properties' => operators(kind, value) }
+        def type_filter(kind, value, controller = nil, permitted = :all)
+          properties = operators(kind, value)
+          properties = narrow(controller, properties, permitted) unless permitted == :all
+          { 'type' => 'object', 'additionalProperties' => false, 'minProperties' => 1, 'properties' => properties }
         end
 
         # [type, 'null'] in place of an anyOf with a null branch. A value
@@ -372,19 +463,82 @@ module StandardMCP
           return :geometry if sql_type.start_with?('geometry')
           return :range if sql_type.end_with?('range')
 
-          case column.type
-          when :json, :jsonb, :hstore then :json
-          when :boolean then :boolean
-          when :string, :text, :citext then :text
-          when :integer, :bigint, :float, :decimal, :date, :datetime, :time, :timestamp, :timestamptz then :ordered
+          type_kind(column.type)
+        end
+
+        # The kind of an attribute type (a name such as 'integer', or a Symbol),
+        # which picks its operators.
+        def type_kind(type, array = false)
+          return :array if array
+
+          case type.to_s
+          when 'json', 'jsonb', 'hstore' then :json
+          when 'boolean' then :boolean
+          when 'string', 'text', 'citext' then :text
+          when 'integer', 'bigint', 'float', 'decimal', 'date', 'datetime', 'time', 'timestamp', 'timestamptz' then :ordered
           else :other
           end
         end
 
         # The JSON type of one value of the column: StandardAPI's mapping for
-        # the json_schema view.
+        # the write, read and query schemas.
         def value_schema(column)
-          (TYPES.json_column_schema(column.sql_type) || fallback_type(column)).transform_keys(&:to_s)
+          without_uuid((TYPES.json_column_schema(column.sql_type) || fallback_type(column)).transform_keys(&:to_s))
+        end
+
+        # The `format: uuid` StandardAPI gives a uuid is left out: an app's typed
+        # ids (Intel's) have no dashes, so the format would reject real values.
+        def without_uuid(schema)
+          schema['format'] == 'uuid' ? schema.except('format') : schema
+        end
+
+        # "string", "string[]", or "office|retail" for an enum column.
+        def column_label(model, column)
+          values = allowed_values(model, column)
+          return values.join('|') if values
+
+          column.array ? "#{column.type}[]" : column.type.to_s
+        end
+
+        # --- definitions (Schema::Definitions entries), for attributes that
+        # needn't be columns
+
+        # The column a definition names, nil for an attribute that has none.
+        def definition_column(model, definition)
+          model&.columns_hash&.[](definition['name'])
+        end
+
+        # A real column keeps its sql_type checks (geometry, ranges); anything
+        # else goes by the definition's type.
+        def definition_kind(model, definition)
+          column = definition_column(model, definition)
+          column ? column_kind(column) : type_kind(definition['type'], definition['array'])
+        end
+
+        # The values the attribute is limited to: the definition's enum, or an
+        # AR enum or inclusion validator of its column.
+        def definition_enum(model, definition)
+          values = definition['enum'].presence
+          column = definition_column(model, definition)
+          values || (allowed_values(model, column) if column)
+        end
+
+        # The JSON type of one value of the attribute: the column's for a real
+        # column, else StandardAPI's mapping of the definition's type.
+        def definition_value_schema(model, definition)
+          column = definition_column(model, definition)
+          return value_schema(column) if column
+
+          without_uuid(TYPES.json_schema_for_type(definition['type'].to_s).transform_keys(&:to_s))
+        end
+
+        # The operators (each mapped to the schema of its value) the attribute
+        # accepts.
+        def definition_operators(model, definition)
+          values = definition_enum(model, definition)
+          return enum_filter(values)['properties'] if values
+
+          operators(definition_kind(model, definition), definition_value_schema(model, definition))
         end
 
         def fallback_type(column)
@@ -527,8 +681,10 @@ module StandardMCP
 
         # --- limit, id
 
+        # The most a call may ask for is the smaller of the controller's
+        # resource_limit and config.max_limit; the default page is held to it.
         def limit_schema(controller)
-          maximum = controller.send(:resource_limit)
+          maximum = [controller.send(:resource_limit), StandardMCP.config.max_limit].compact.min
           default = controller.send(:default_limit) || StandardMCP.config.default_limit
           default = [default, maximum].min if default && maximum
 
@@ -554,17 +710,32 @@ module StandardMCP
           %i[json jsonb hstore binary].include?(column.type)
         end
 
-        def select_schema(columns)
+        # The names of the +columns+ each aggregate takes: minimum and maximum
+        # the orderable ones, average and sum the numeric ones, count any
+        # scalar one. An aggregate no column suits is absent.
+        def aggregate_names(columns)
           scalar = columns.reject { |c| c.array || ungroupable?(c) }
           orderable = scalar.select { |c| column_kind(c) == :text || column_kind(c) == :ordered }.reject { |c| c.type == :uuid }
           numeric = scalar.select { |c| %i[integer bigint float decimal].include?(c.type) }
 
+          names = {}
+          names['minimum'] = orderable.map(&:name) if orderable.any?
+          names['maximum'] = orderable.map(&:name) if orderable.any?
+          names['average'] = numeric.map(&:name) if numeric.any?
+          names['sum'] = numeric.map(&:name) if numeric.any?
+          names['count'] = scalar.map(&:name)
+          names
+        end
+
+        def select_schema(columns)
+          names = aggregate_names(columns)
+
           functions = {}
-          functions['minimum'] = { 'enum' => orderable.map(&:name) } if orderable.any?
-          functions['maximum'] = { 'enum' => orderable.map(&:name) } if orderable.any?
-          functions['average'] = aggregate_argument(numeric.map(&:name)) if numeric.any?
-          functions['sum'] = aggregate_argument(numeric.map(&:name)) if numeric.any?
-          functions['count'] = aggregate_argument(scalar.map(&:name), star: true)
+          functions['minimum'] = { 'enum' => names['minimum'] } if names['minimum']
+          functions['maximum'] = { 'enum' => names['maximum'] } if names['maximum']
+          functions['average'] = aggregate_argument(names['average']) if names['average']
+          functions['sum'] = aggregate_argument(names['sum']) if names['sum']
+          functions['count'] = aggregate_argument(names['count'], star: true)
 
           {
             'type' => 'array',
@@ -592,7 +763,9 @@ module StandardMCP
         # Shared with Schema::Where, which describes and checks filters with the
         # same tables, and Schema::Attributes, which types the written record.
         public :column_kind, :column_operators, :allowed_values, :klass_for, :association_description,
-          :value_schema, :scalar_schema, :nullable, :id_schema
+          :value_schema, :scalar_schema, :nullable, :id_schema, :type_kind, :without_uuid, :definition_kind,
+          :definition_enum, :definition_value_schema, :definition_operators, :column_label, :aggregate_names,
+          :ungroupable?
       end
     end
   end

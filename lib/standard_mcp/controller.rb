@@ -87,6 +87,15 @@ module StandardMCP
       end
     end
 
+    # Whether this request comes from MCP: the in-process request a tool call
+    # dispatched (the Dispatcher marks its env with DISPATCHED_ENV), or the
+    # throwaway instance `allow_mcp` conditions and the schemas are evaluated
+    # on. Lets ACL code and `allow_mcp if:` conditions tell an agent from the
+    # app's own JSON API.
+    def mcp_request?
+      @standard_mcp_request == true || request&.env&.[](DISPATCHED_ENV) == true
+    end
+
     # Actions exposed for the current request: those whose covering rule's
     # conditions pass on this instance.
     def mcp_actions_allowed

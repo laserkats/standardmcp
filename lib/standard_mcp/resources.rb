@@ -4,9 +4,13 @@ module StandardMCP
   # The MCP resource templates for one request, built like the tools (per
   # request, closing over it) so what a caller sees depends on the caller:
   #
-  # - `standardmcp://schema/{resource}`: the full detail of a controller's
-  #   model for this caller (Schema::Document), which the shallow tool schemas
-  #   leave out. `resource` is the controller path with `/` written as `_`
+  # - `standardmcp://schema/{resource}`: what a controller's model offers this
+  #   caller, as `{ "query": ..., "attributes": ... }`: the documents the
+  #   `describe_query` and `describe_attributes` tools return for no where
+  #   (Schema::QueryDocument, and the `read` and `write` JSON Schemas of
+  #   StandardAPI's `read_schema` and `write_schema` actions, `write` only for
+  #   a caller who may create or update), which the shallow tool schemas leave
+  #   out. `resource` is the controller path with `/` written as `_`
   #   (`admin_accounts`), the segment the tool names use, so it needs no `/`
   #   (a `{var}` of the mcp gem matches one path segment, and nothing is
   #   percent-decoded).
@@ -86,24 +90,68 @@ module StandardMCP
         entries
       end
 
-      # The schema document (a Hash) of resource +name+ for +request+, or nil
+      # { model => resource name } for the models +entries+ serve, to say which
+      # resource describes an association.
+      def links(entries)
+        entries.each_with_object({}) { |entry, result| result[entry.klass.model] ||= entry.name }
+      end
+
+      # The query document of resource +name+ for +request+ (a Hash), or nil
       # when the caller has no allowed action on that controller (or none
-      # exists). +entries+ is `entries(Registry.allowed(request))`.
-      def document(request, entries, name)
+      # exists). +entries+ is `entries(Registry.allowed(request))`. +where+ is
+      # the where the keys depend on; the definitions are asked for it once. A
+      # where that doesn't hold up raises Schema::Where::Invalid.
+      def document(request, entries, name, where: nil)
         entry = entries.find { |candidate| candidate.name == name }
         return unless entry
 
-        links = entries.each_with_object({}) { |other, result| result[other.klass.model] ||= other.name }
         controller = Registry.controller_for(entry.klass, request)
-        Schema::Document.for(controller, name: entry.name, actions: entry.actions, links: links)
+        definitions = Schema::Where.checked_definitions(controller, where)
+        Schema::QueryDocument.for(controller, name: entry.name, actions: entry.actions, links: links(entries),
+          where: where, definitions: definitions)
+      end
+
+      # The attributes of resource +name+ as `{ read:, write: }`, the JSON
+      # Schemas StandardAPI's `read_schema` and `write_schema` actions render
+      # for +where+, unchanged, as a Response (an error result when an action
+      # answers 4xx; a 5xx raises). `write` is left out when the caller may
+      # neither create nor update. nil when the caller has no allowed action on
+      # that controller (or none exists). The actions run in-process like a
+      # tool call, so the callbacks and the ACL's `schemas` hook (which reads
+      # `params[:where]`) run too. A where that doesn't hold up raises
+      # Schema::Where::Invalid.
+      def attributes(request, entries, name, where = nil)
+        entry = entries.find { |candidate| candidate.name == name }
+        return unless entry
+
+        errors = Schema::Where.errors(Registry.controller_for(entry.klass, request), where)
+        raise Schema::Where::Invalid, errors if errors.any?
+
+        dispatcher = Dispatcher.new(request)
+        params = { 'where' => where }.compact
+        schemas = {}
+        actions = { read: :read_schema }
+        actions[:write] = :write_schema if dispatcher.allowed?(entry.klass, :write_schema)
+
+        actions.each do |key, action|
+          response = Response.from(dispatcher.call(entry.klass, action, params), action: action)
+          return response if response.error?
+
+          schemas[key] = response.structured_content
+        end
+        Response.document(schemas)
+      rescue ActionNotAllowed
+        nil
       end
 
       # Runs one schema read (public: the template body is a block evaluated
       # on the template class, which can't reach private methods here).
       def read_schema(request, entries, name, uri)
-        found = document(request, entries, name) or raise not_found(uri)
-        text(uri, found)
-      end
+        query = document(request, entries, name) or raise not_found(uri)
+        response = attributes(request, entries, name) or raise not_found(uri)
+        raise invalid(response.structured_content[:error]) if response.error?
+
+        text(uri, { 'query' => query, 'attributes' => response.structured_content })      end
 
       # Runs one record read. +id+ is the URI's id, as given.
       def read_record(request, entry, id, uri)
@@ -160,8 +208,9 @@ module StandardMCP
           uri_template: "#{base}/{resource}",
           name: 'schema',
           title: 'Resource schema',
-          description: 'Columns with types, enums, filter operators and flags (nullable, orderable, writable), ' \
-            "associations and the where rules of a resource. Resources: #{names.join(', ')}.",
+          description: 'What a resource offers: "query" has the keys and operators of where, the order keys and the ' \
+            'associations to include; "attributes" has the JSON Schema of a record ("read") and, for callers who ' \
+            "may write, of the params of create and update (\"write\"). Resources: #{names.join(', ')}.",
           mime_type: MIME_TYPE
         ) do |resource:, server_context: nil|
           Resources.read_schema(request, entries, resource, "#{base}/#{resource}")

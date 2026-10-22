@@ -34,28 +34,38 @@ module StandardMCP
     # in that case, so a tool must always send one.
     attr_accessor :default_limit
 
+    # The most records one `list_*` call may ask for, separate from the
+    # controller's `resource_limit` (which bounds the JSON API): the `limit`
+    # schema's maximum is the smaller of the two, and the default page size is
+    # held to it. A bigger `limit` is rejected by schema validation. nil turns
+    # this cap off, leaving the controller's alone.
+    attr_reader :max_limit
+
     # How many association levels the `where` schema nests: 0 offers only the
     # model's own columns, 1 (the default) adds the columns of its permitted
     # includes, 2 theirs in turn, and so on. Always bounded by what the
-    # controller's `model_includes` permits; `include` itself is not limited.
+    # model's ACL `includes` permits; `include` itself is not limited.
     # Only used when `input_schema_depth` is 'deep' (nested records of a write
-    # are typed to any depth, cycles aside); the shallow `where` lists
-    # every permitted association and checks calls against the model instead.
+    # are typed to any depth, cycles aside).
     attr_accessor :where_depth
 
-    # How much of the `where` filter the input schemas spell out.
+    # How much the input schemas spell out.
     #
-    # 'shallow' (the default): `where` is a bare object and the tool
-    # description lists the filterable columns, operators and associations in
-    # prose. That is a fraction of the tokens, and calls are checked against
-    # the model before they run (StandardMCP::Schema::Where), answering with
-    # a readable tool error.
+    # 'shallow' (the default): `where`, `order`, `include` and the written record
+    # are loose objects with a sentence pointing at `describe_query` or
+    # `describe_attributes` for the keys. No column, key or association list is in
+    # `tools/list`, which keeps it small however wide the models are. Calls are
+    # checked before they run (StandardMCP::Schema::Where), answering a mistake
+    # with a readable tool error that names the describe call to make.
     #
-    # 'deep': `where` is fully typed (a filter definition per column type,
-    # inline enums, nested association columns bounded by `where_depth`) and the
-    # MCP server rejects a bad filter by schema validation. The nested records of
-    # create and update are typed from their own ACL too; shallow leaves them
-    # loose objects described in prose (the top-level attributes are typed either way).
+    # 'deep' (opt-in): the typed schemas. `where` is fully typed (a filter
+    # definition per column type, inline enums, nested association columns
+    # bounded by `where_depth`) but only offers the keys and operators the
+    # ACL's `wheres` permit, and the MCP server rejects a bad filter by schema
+    # validation. The nested records of create and update are typed from their
+    # own ACL too. Deep types real columns only: attributes that depend on the
+    # where (the ACL's `schemas` hook) are not in it, and `tools/list`
+    # grows with the models.
     #
     # Accepts a String or Symbol.
     attr_reader :input_schema_depth
@@ -63,9 +73,10 @@ module StandardMCP
     INPUT_SCHEMA_DEPTHS = %w[shallow deep].freeze
 
     # Whether tools declare an `outputSchema` (and a server can validate
-    # results against it). Off by default: it is about a quarter of the
-    # tools/list payload. `structuredContent` and the text content are
-    # returned either way.
+    # results against it). Off by default: it lists every column of every model
+    # again, which next to the small shallow input schemas is most of the
+    # tools/list payload. `structuredContent` and the text content are returned
+    # either way.
     attr_accessor :output_schema
 
     # Whether the endpoint validates tool results against their output schema
@@ -75,8 +86,9 @@ module StandardMCP
     attr_writer :validate_results
 
     # Which resource templates the endpoint serves (StandardMCP::Resources):
-    # `schema` is `standardmcp://schema/{resource}`, the full column and
-    # association detail of a controller; `records` is
+    # `schema` is `standardmcp://schema/{resource}`, what
+    # `describe_query` and `describe_attributes` return for a controller (with
+    # no where); `records` is
     # `standardmcp://<resource>/{id}` per controller that allows show, so a
     # client can attach a record as context. An Array of Symbols or Strings;
     # [] serves none (and the endpoint doesn't advertise `resources`).
@@ -84,9 +96,11 @@ module StandardMCP
 
     RESOURCE_KINDS = %i[schema records].freeze
 
-    # Whether the `describe` tool is listed. It returns the same document as
-    # the `schema` resource, for clients that can't read resources.
-    attr_accessor :describe_tool
+    # Whether the `describe_query` and `describe_attributes` tools are listed,
+    # and the tool schemas and descriptions point to them. Together they return
+    # what the `schema` resource does, for clients that can't read resources
+    # (and for a where the resource can't take).
+    attr_accessor :describe_tools
 
     # URI scheme of the resource templates. RFC 3986: a letter, then letters,
     # digits, `+`, `-` or `.`.
@@ -114,6 +128,7 @@ module StandardMCP
       @lint_ignore_columns = %w[id created_at updated_at]
       @dispatch_env = ->(request) { {} }
       @default_limit = 25
+      @max_limit = 100
       @where_depth = 1
       @input_schema_depth = 'shallow'
       @output_schema = false
@@ -121,8 +136,16 @@ module StandardMCP
       @exception_reporter = nil
       @allowed_origins = nil
       @resources = RESOURCE_KINDS
-      @describe_tool = true
+      @describe_tools = true
       @resource_scheme = 'standardmcp'
+    end
+
+    def max_limit=(value)
+      unless value.nil? || (value.is_a?(Integer) && value > 0)
+        raise ArgumentError, "max_limit must be a positive Integer or nil, got #{value.inspect}"
+      end
+
+      @max_limit = value
     end
 
     def resources=(value)

@@ -481,7 +481,7 @@ module StandardMCP
         end
 
         # The JSON type of one value of the column: StandardAPI's mapping for
-        # the json_schema view.
+        # the write, read and query schemas.
         def value_schema(column)
           without_uuid((TYPES.json_column_schema(column.sql_type) || fallback_type(column)).transform_keys(&:to_s))
         end

@@ -4,7 +4,7 @@ require 'standard_mcp/test_helper'
 # `schemas` hook defines when the where names account_id. Only listed for
 # callers sending X-MCP-Scoped.
 class ScopedPropertiesController < ApplicationController
-  allow_mcp only: [:index, :show], if: :scoped?
+  allow_mcp only: [:index, :show, :create, :update], if: :scoped?
 
   def self.model
     Property
@@ -14,6 +14,10 @@ class ScopedPropertiesController < ApplicationController
     super + [:account_name]
   end
 
+  def property_attributes(record = nil)
+    super() + [:account_name]
+  end
+
   private
 
   def scoped?
@@ -21,7 +25,7 @@ class ScopedPropertiesController < ApplicationController
   end
 end
 
-# A callback that refuses revoked bearers, on every action including json_schema.
+# A callback that refuses revoked bearers, on every action including the schema ones.
 class GatedPropertiesController < ApplicationController
   allow_mcp only: [:index, :show], if: :gated?
   before_action :refuse_revoked
@@ -89,16 +93,39 @@ class DescribeAttributesTest < ActiveSupport::TestCase
     found.dig(:structuredContent, :error)
   end
 
-  # What the json_schema action renders for the controller.
-  def rendered(klass, headers = {}, params = {})
-    StandardMCP::Dispatcher.new(request_for(headers)).call(klass, :json_schema, params).json
+  # What the read_schema or write_schema action renders for the controller.
+  def rendered(klass, action, headers = {}, params = {})
+    StandardMCP::Dispatcher.new(request_for(headers)).call(klass, action, params).json
   end
 
-  # --- the view
+  def stringified(value)
+    JSON.parse(JSON.generate(value))
+  end
 
-  test "describe_attributes is what the json_schema action renders" do
-    assert_equal rendered(PropertiesController), JSON.parse(JSON.generate(attributes({}, 'properties')))
-    assert_equal rendered(AccountsController), JSON.parse(JSON.generate(attributes({}, 'accounts')))
+  # --- the schemas
+
+  test "describe_attributes is what the read_schema and write_schema actions render" do
+    writes = { 'X-MCP-Writes' => 'true' }
+    found = stringified(attributes(writes, 'properties'))
+
+    assert_equal %w[read write], found.keys
+    assert_equal rendered(PropertiesController, :read_schema, writes), found['read']
+    assert_equal rendered(PropertiesController, :write_schema, writes), found['write']
+  end
+
+  test "write is absent for a caller who can't create or update" do
+    found = stringified(attributes({}, 'accounts'))
+
+    assert_equal %w[read], found.keys
+    assert_equal rendered(AccountsController, :read_schema), found['read']
+    # Properties allows create and update only with X-MCP-Writes.
+    assert_equal %w[read], stringified(attributes({}, 'properties')).keys
+  end
+
+  test "a caller who can only write gets both" do
+    found = stringified(attributes({ 'X-MCP-Writes' => 'true' }, 'contacts'))
+
+    assert_equal %w[read write], found.keys
   end
 
   test "the text content is the same document" do
@@ -107,8 +134,8 @@ class DescribeAttributesTest < ActiveSupport::TestCase
     assert_equal JSON.parse(JSON.generate(found[:structuredContent])), JSON.parse(found[:content].first[:text])
   end
 
-  test "the JSON Schema carries types, comments, enums, defaults, readOnly and required" do
-    schema = attributes({}, 'properties')
+  test "read describes a record: types, comments, enums and required" do
+    schema = attributes({}, 'properties')[:read]
     properties = schema[:properties]
 
     assert_equal 'object', schema[:type]
@@ -116,26 +143,43 @@ class DescribeAttributesTest < ActiveSupport::TestCase
     assert_equal ['integer', 'null'], properties[:size][:type]
     assert_equal 'Rentable area in square feet.', properties[:size][:description]
     assert_equal %w[office retail industrial], properties[:kind][:enum].compact
-    assert_equal true, properties[:available][:default]
-    assert_equal true, properties[:id][:readOnly]
-    assert_equal ['name'], schema[:required]
+    assert_equal ['string', 'null'], properties[:rent][:type]
+    assert_includes schema[:required], 'id'
   end
 
-  test "the schema is returned unchanged: no keyword is added, removed or renamed" do
-    schema =attributes({ 'X-MCP-Writes' => 'true' }, 'contacts')
-    action = rendered(ContactsController, 'X-MCP-Writes' => 'true')
+  test "write describes the params of create and update: types, defaults, validations and required" do
+    schema = attributes({ 'X-MCP-Writes' => 'true' }, 'properties')[:write]
+    record = schema[:properties][:property]
 
-    assert_equal action, JSON.parse(JSON.generate(schema))
-    assert_equal 'string', action['properties']['name']['type']
-    assert_equal 50, action['properties']['name']['maxLength']
-    assert_equal 150, action['properties']['age']['exclusiveMaximum']
+    assert_equal ['property'], schema[:properties].keys.map(&:to_s)
+    assert_equal ['integer', 'null'], record[:properties][:size][:type]
+    assert_equal true, record[:properties][:available][:default]
+    assert_equal ['name'], record[:required]
+    # Only what the ACL's attributes permit.
+    refute record[:properties].key?(:id)
+    refute record[:properties].key?(:created_at)
+
+    contact = attributes({ 'X-MCP-Writes' => 'true' }, 'contacts')[:write].dig(:properties, :contact, :properties)
+    assert_equal 50, contact[:name][:maxLength]
+    assert_equal 150, contact[:age][:exclusiveMaximum]
   end
 
-  test "no include is forwarded to the action" do
-    StandardMCP::Dispatcher.any_instance.expects(:call).with(PropertiesController, :json_schema, {})
-      .returns(StandardMCP::Dispatcher::Result.new(status: 200, headers: {}, body: '{}'))
+  test "read lists the photo column the ACL excludes, write does not" do
+    # An open review item on StandardAPI PR 109: read_schema doesn't apply the
+    # ACL's excludes, so the excluded column is described.
+    found = attributes({ 'X-MCP-Writes' => 'true' }, 'properties')
+    photo = StandardMCP::Registry.controller_for(PropertiesController, request_for).send(:read_schema_for, Photo, {})
 
-    attributes({}, 'properties')
+    assert_includes photo['properties'].keys, 'internal_path'
+    refute_includes JSON.generate(found[:write]), 'internal_path'
+  end
+
+  test "no include is forwarded to either action" do
+    result = StandardMCP::Dispatcher::Result.new(status: 200, headers: {}, body: '{}')
+    StandardMCP::Dispatcher.any_instance.expects(:call).with(PropertiesController, :read_schema, {}).returns(result)
+    StandardMCP::Dispatcher.any_instance.expects(:call).with(PropertiesController, :write_schema, {}).returns(result)
+
+    attributes({ 'X-MCP-Writes' => 'true' }, 'properties')
   end
 
   # --- the where
@@ -145,17 +189,31 @@ class DescribeAttributesTest < ActiveSupport::TestCase
 
     with = attributes(SCOPED, 'scoped_properties', where)
     without = attributes(SCOPED, 'scoped_properties')
+    other = attributes(SCOPED, 'scoped_properties', { name: { eq: 'x' } })
 
-    assert_equal 'Name of the account the list is for.', with[:properties][:account_name][:description]
-    assert_equal true, with[:properties][:account_name][:readOnly]
-    refute without[:properties].key?(:account_name)
-    refute attributes(SCOPED, 'scoped_properties', { name: { eq: 'x' } })[:properties].key?(:account_name)
+    assert_equal 'Name of the account the list is for.', with.dig(:read, :properties, :account_name, :description)
+    assert_equal 'Name of the account the list is for.', with.dig(:write, :properties, :property, :properties, :account_name, :description)
+    [without, other].each do |found|
+      refute found[:read][:properties].key?(:account_name)
+      # The ACL permits it but no definition describes it, so write has it as any value.
+      assert_equal({}, found[:write][:properties][:property][:properties][:account_name])
+    end
+  end
+
+  test "the where-dependent key is in read and write, as each action renders it" do
+    where = { account_id: { eq: 1 } }
+    found = stringified(attributes(SCOPED, 'scoped_properties', where))
+
+    assert_equal rendered(ScopedPropertiesController, :read_schema, SCOPED, { 'where' => where }), found['read']
+    assert_equal rendered(ScopedPropertiesController, :write_schema, SCOPED, { 'where' => where }), found['write']
   end
 
   test "an array where reaches the hook too" do
     where = [{ account_id: { eq: 1 } }, 'OR', { account_id: { eq: 2 } }]
+    found = attributes(SCOPED, 'scoped_properties', where)
 
-    assert attributes(SCOPED, 'scoped_properties', where)[:properties].key?(:account_name)
+    assert found[:read][:properties].key?(:account_name)
+    assert found[:write][:properties][:property][:properties].key?(:account_name)
   end
 
   test "the definition for a where is in describe_query too, and a filter on it validates" do
@@ -209,7 +267,21 @@ class DescribeAttributesTest < ActiveSupport::TestCase
 
   test "a callback that refuses the caller makes describe_attributes an error" do
     assert_equal 'Unauthorized', error(GATED.merge('Authorization' => 'Bearer revoked'), 'describe_attributes', { resource: 'gated_properties' })
-    assert_equal 'Property', attributes(GATED.merge('Authorization' => 'Bearer 1'), 'gated_properties')[:title]
+    assert_equal 'Property', attributes(GATED.merge('Authorization' => 'Bearer 1'), 'gated_properties')[:read][:title]
+  end
+
+  test "an error from the write schema is an error result, not a partial document" do
+    request = request_for('X-MCP-Writes' => 'true')
+    entries = StandardMCP::Resources.entries(StandardMCP::Registry.allowed(request))
+    StandardMCP::Dispatcher.any_instance.stubs(:call).returns(
+      StandardMCP::Dispatcher::Result.new(status: 200, headers: {}, body: '{}'),
+      StandardMCP::Dispatcher::Result.new(status: 403, headers: {}, body: '')
+    )
+
+    response = StandardMCP::Tools.describe(request, entries, 'describe_attributes', 'properties')
+
+    assert response.error?
+    assert_equal 'Forbidden', response.structured_content[:error]
   end
 
   test "a 5xx from the action raises" do
@@ -247,9 +319,11 @@ class DescribeAttributesTest < ActiveSupport::TestCase
     assert_nil StandardMCP::Resources.attributes(request, entries, 'contacts')
   end
 
-  test "the dispatcher still refuses json_schema for a controller the caller has no action on" do
-    assert_raises(StandardMCP::ActionNotAllowed) do
-      StandardMCP::Dispatcher.new(request_for).call(ContactsController, :json_schema)
+  test "the dispatcher still refuses the schema actions for a controller the caller has no action on" do
+    %i[read_schema write_schema].each do |action|
+      assert_raises(StandardMCP::ActionNotAllowed) do
+        StandardMCP::Dispatcher.new(request_for).call(ContactsController, action)
+      end
     end
   end
 

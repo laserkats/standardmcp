@@ -771,7 +771,8 @@ class ToolsTest < ActiveSupport::TestCase
     assert_equal 'Describe what a resource can be queried by', query[:title]
     %w[keys operators associations].each { |word| assert_includes query[:description], word }
     assert_equal 'Describe what a resource contains', attributes[:title]
-    ['JSON Schema', 'type', 'enum', 'default', 'readOnly', 'required'].each { |word| assert_includes attributes[:description], word }
+    ['JSON Schema', '"read"', '"write"', 'create and update', 'type', 'enum', 'default', 'readOnly', 'required']
+      .each { |word| assert_includes attributes[:description], word }
     %w[writable withheld only_in].each { |word| refute_includes attributes[:description], word }
   end
 
@@ -807,16 +808,19 @@ class ToolsTest < ActiveSupport::TestCase
 
       refute result[:isError]
       assert_equal document, JSON.parse(result[:content].first[:text])
-      assert_equal resource, document
+      assert_equal JSON.parse(JSON.generate(resource)), document
     end
     assert_equal 'properties', structured('describe_query', { resource: 'properties' }, WRITES)[:resource]
-    assert_equal 'Property', structured('describe_attributes', { resource: 'properties' }, WRITES)[:title]
+    assert_equal 'Property', structured('describe_attributes', { resource: 'properties' }, WRITES).dig(:read, :title)
   end
 
-  test "describe_attributes is the JSON Schema the json_schema action renders" do
-    rendered = StandardMCP::Dispatcher.new(request_for).call(PropertiesController, :json_schema).json
+  test "describe_attributes is the schemas the read_schema and write_schema actions render" do
+    dispatcher = StandardMCP::Dispatcher.new(request_for(WRITES))
+    read = dispatcher.call(PropertiesController, :read_schema).json
+    write = dispatcher.call(PropertiesController, :write_schema).json
 
-    assert_equal rendered, JSON.parse(JSON.generate(structured('describe_attributes', { resource: 'properties' })))
+    assert_equal({ 'read' => read, 'write' => write },
+      JSON.parse(JSON.generate(structured('describe_attributes', { resource: 'properties' }, WRITES))))
   end
 
   test "a namespaced resource is written with underscores" do
@@ -824,7 +828,7 @@ class ToolsTest < ActiveSupport::TestCase
 
     assert_equal 'admin_accounts', document[:resource]
     assert document.key?(:where)
-    assert_equal 'Account', structured('describe_attributes', { resource: 'admin_accounts' }, 'X-MCP-Admin' => 'true')[:title]
+    assert_equal 'Account', structured('describe_attributes', { resource: 'admin_accounts' }, 'X-MCP-Admin' => 'true').dig(:read, :title)
   end
 
   test "a hidden resource is not in the enum and can't be described" do
@@ -838,19 +842,32 @@ class ToolsTest < ActiveSupport::TestCase
     end
   end
 
-  test "a where is dispatched to json_schema as params[:where]" do
+  test "a where is dispatched to read_schema and write_schema as params[:where]" do
     where = { size: { gte: 1 } }
-    StandardMCP::Dispatcher.any_instance.expects(:call).with(PropertiesController, :json_schema, { 'where' => { 'size' => { 'gte' => 1 } } })
-      .returns(StandardMCP::Dispatcher::Result.new(status: 200, headers: {}, body: '{"title":"Property"}'))
+    result = StandardMCP::Dispatcher::Result.new(status: 200, headers: {}, body: '{"title":"Property"}')
+    %i[read_schema write_schema].each do |action|
+      StandardMCP::Dispatcher.any_instance.expects(:call)
+        .with(PropertiesController, action, { 'where' => { 'size' => { 'gte' => 1 } } }).returns(result)
+    end
 
-    assert_equal({ title: 'Property' }, structured('describe_attributes', { resource: 'properties', where: where }))
+    assert_equal({ read: { title: 'Property' }, write: { title: 'Property' } },
+      structured('describe_attributes', { resource: 'properties', where: where }, WRITES))
   end
 
-  test "describe_attributes dispatches json_schema with no where when none is given, and never an include" do
-    StandardMCP::Dispatcher.any_instance.expects(:call).with(PropertiesController, :json_schema, {})
-      .returns(StandardMCP::Dispatcher::Result.new(status: 200, headers: {}, body: '{"title":"Property"}'))
+  test "describe_attributes dispatches with no where when none is given, and never an include" do
+    result = StandardMCP::Dispatcher::Result.new(status: 200, headers: {}, body: '{"title":"Property"}')
+    %i[read_schema write_schema].each do |action|
+      StandardMCP::Dispatcher.any_instance.expects(:call).with(PropertiesController, action, {}).returns(result)
+    end
 
-    structured('describe_attributes', { resource: 'properties' })
+    structured('describe_attributes', { resource: 'properties' }, WRITES)
+  end
+
+  test "a caller who can't write gets only the read schema, and no write_schema is dispatched" do
+    result = StandardMCP::Dispatcher::Result.new(status: 200, headers: {}, body: '{"title":"Property"}')
+    StandardMCP::Dispatcher.any_instance.expects(:call).with(PropertiesController, :read_schema, {}).returns(result)
+
+    assert_equal({ read: { title: 'Property' } }, structured('describe_attributes', { resource: 'properties' }))
   end
 
   test "a where that couldn't list is an error from either describe tool" do

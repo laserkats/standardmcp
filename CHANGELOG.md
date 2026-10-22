@@ -36,11 +36,12 @@
   status. A refused delete was previously raised as a server error.
 - Progressive discovery. The `describe` tool is replaced by `describe_query`
   (the keys and operators of `where`, the `order` keys, the associations to
-  include) and `describe_attributes` (the JSON Schema StandardAPI's
-  `json_schema` view renders, unchanged: types, descriptions, enums, defaults,
-  `readOnly`, `required`, validation constraints), both taking an optional
-  `where`; `standardmcp://schema/{resource}` is now
-  `{ "query": ..., "attributes": <JSON Schema> }`. In the default shallow mode no
+  include) and `describe_attributes` (`{ "read": ..., "write": ... }`, the JSON
+  Schemas StandardAPI's `read_schema` and `write_schema` actions render,
+  unchanged: types, descriptions, enums, defaults, `readOnly`, `required`,
+  validation constraints; `write` only for a caller who may create or update),
+  both taking an optional `where`; `standardmcp://schema/{resource}` is now
+  `{ "query": ..., "attributes": { "read": ..., "write": ... } }`. In the default shallow mode no
   tool schema or description lists a column, key or association: `where`,
   `order`, `include`, the written record and a calculate's `select` and
   `group_by` are loose and point at the describe tools. `config.describe_tool`
@@ -50,16 +51,22 @@
   against the ACL, `select` and `group_by` against the columns, and a written
   record against the typed schema. Errors say which describe call to make.
 - Attributes can depend on the where: `describe_attributes` dispatches the
-  controller's `json_schema` action in-process (callbacks and authentication
-  run) with the where as `params[:where]`, and `describe_query` and the
+  controller's `read_schema` and `write_schema` actions in-process (callbacks
+  and authentication run) with the where as `params[:where]`, and `describe_query` and the
   where checks ask `schemas_for` on a controller bound to it, so the ACL's
   `schemas` hook (StandardAPI PR 108) can read `params[:where]` and use
   `mcp_request?`. `describe_query` copies `only_in` and `types` from a
-  definition that carries them. The dispatcher allows `json_schema` for a
-  caller with any allowed MCP action on the controller.
+  definition that carries them. The dispatcher allows `read_schema` for a
+  caller with any allowed MCP action on the controller, and `write_schema` for
+  one who may create or update.
 - `config.max_limit` (100 by default) caps the page size of `list_*` apart from
   the controller's `resource_limit`. `mcp_request?` and
   `StandardMCP::DISPATCHED_ENV` tell a request MCP dispatched.
-- No schema, document or output schema carries `format: uuid`.
-- Builds on standardapi PR 108 and master's ACL `wheres`; deep mode only offers
-  the keys and operators the ACL's `wheres` permit.
+- No tool input schema or `describe_query` document carries `format: uuid`.
+- Output schemas (`config.output_schema`) take the record from StandardAPI's
+  `read_schema_for` instead of adapting the removed `json_schema` view, so they
+  follow StandardAPI's read schema (including its `format: uuid` and
+  `additionalProperties: false`); the includes a call may ask for are described
+  but not required.
+- Builds on standardapi PR 109 (stacked on PR 108) and master's ACL `wheres`;
+  deep mode only offers the keys and operators the ACL's `wheres` permit.

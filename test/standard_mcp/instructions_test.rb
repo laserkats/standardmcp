@@ -106,7 +106,7 @@ class InstructionsTest < ActiveSupport::TestCase
     text = instructions
 
     assert_includes text, %(describe_query {"resource": "accounts"} returns the keys, operators and associations of where, order and include; )
-    assert_includes text, %(describe_attributes {"resource": "accounts"} returns a record's JSON Schema, with which attributes are read only or required. )
+    assert_includes text, %(describe_attributes {"resource": "accounts"} returns the JSON Schema of a record and, for writers, of the params of create and update (which attributes are read only or required). )
     assert_includes text, 'Pass them the where you will use, as some keys depend on it.'
     refute_includes text, '"/" in a resource name'
   end

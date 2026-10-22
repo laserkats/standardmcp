@@ -7,8 +7,10 @@ module StandardMCP
   # - `standardmcp://schema/{resource}`: what a controller's model offers this
   #   caller, as `{ "query": ..., "attributes": ... }`: the documents the
   #   `describe_query` and `describe_attributes` tools return for no where
-  #   (Schema::QueryDocument, and the JSON Schema of StandardAPI's `json_schema`
-  #   action), which the shallow tool schemas leave out. `resource` is the controller path with `/` written as `_`
+  #   (Schema::QueryDocument, and the `read` and `write` JSON Schemas of
+  #   StandardAPI's `read_schema` and `write_schema` actions, `write` only for
+  #   a caller who may create or update), which the shallow tool schemas leave
+  #   out. `resource` is the controller path with `/` written as `_`
   #   (`admin_accounts`), the segment the tool names use, so it needs no `/`
   #   (a `{var}` of the mcp gem matches one path segment, and nothing is
   #   percent-decoded).
@@ -109,13 +111,15 @@ module StandardMCP
           where: where, definitions: definitions)
       end
 
-      # The attributes of resource +name+ as the JSON Schema StandardAPI's
-      # `json_schema` action renders for +where+, unchanged, as a Response (an
-      # error result when the action answers 4xx; a 5xx raises). nil when the
-      # caller has no allowed action on that controller (or none exists). The
-      # action runs in-process like a tool call, so the callbacks and the ACL's
-      # `schemas` hook (which reads `params[:where]`) run too. A where that
-      # doesn't hold up raises Schema::Where::Invalid.
+      # The attributes of resource +name+ as `{ read:, write: }`, the JSON
+      # Schemas StandardAPI's `read_schema` and `write_schema` actions render
+      # for +where+, unchanged, as a Response (an error result when an action
+      # answers 4xx; a 5xx raises). `write` is left out when the caller may
+      # neither create nor update. nil when the caller has no allowed action on
+      # that controller (or none exists). The actions run in-process like a
+      # tool call, so the callbacks and the ACL's `schemas` hook (which reads
+      # `params[:where]`) run too. A where that doesn't hold up raises
+      # Schema::Where::Invalid.
       def attributes(request, entries, name, where = nil)
         entry = entries.find { |candidate| candidate.name == name }
         return unless entry
@@ -123,8 +127,19 @@ module StandardMCP
         errors = Schema::Where.errors(Registry.controller_for(entry.klass, request), where)
         raise Schema::Where::Invalid, errors if errors.any?
 
-        result = Dispatcher.new(request).call(entry.klass, :json_schema, { 'where' => where }.compact)
-        Response.from(result, action: :json_schema)
+        dispatcher = Dispatcher.new(request)
+        params = { 'where' => where }.compact
+        schemas = {}
+        actions = { read: :read_schema }
+        actions[:write] = :write_schema if dispatcher.allowed?(entry.klass, :write_schema)
+
+        actions.each do |key, action|
+          response = Response.from(dispatcher.call(entry.klass, action, params), action: action)
+          return response if response.error?
+
+          schemas[key] = response.structured_content
+        end
+        Response.document(schemas)
       rescue ActionNotAllowed
         nil
       end
@@ -136,8 +151,7 @@ module StandardMCP
         response = attributes(request, entries, name) or raise not_found(uri)
         raise invalid(response.structured_content[:error]) if response.error?
 
-        text(uri, { 'query' => query, 'attributes' => response.structured_content })
-      end
+        text(uri, { 'query' => query, 'attributes' => response.structured_content })      end
 
       # Runs one record read. +id+ is the URI's id, as given.
       def read_record(request, entry, id, uri)
@@ -195,8 +209,8 @@ module StandardMCP
           name: 'schema',
           title: 'Resource schema',
           description: 'What a resource offers: "query" has the keys and operators of where, the order keys and the ' \
-            'associations to include; "attributes" is the JSON Schema of a record (types, descriptions, enums, ' \
-            "defaults, readOnly, required). Resources: #{names.join(', ')}.",
+            'associations to include; "attributes" has the JSON Schema of a record ("read") and, for callers who ' \
+            "may write, of the params of create and update (\"write\"). Resources: #{names.join(', ')}.",
           mime_type: MIME_TYPE
         ) do |resource:, server_context: nil|
           Resources.read_schema(request, entries, resource, "#{base}/#{resource}")

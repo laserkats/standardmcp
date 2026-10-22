@@ -106,7 +106,7 @@ class PreviewTest < ActiveSupport::TestCase
     printed = JSON.parse(@io.string)
 
     assert_equal 'accounts', printed['query']['resource']
-    assert_includes printed['attributes']['properties'].keys, 'name'
+    assert_includes printed['attributes']['read']['properties'].keys, 'name'
     assert_equal 'standardmcp://schema/accounts', result[:contents][:uri]
   end
 

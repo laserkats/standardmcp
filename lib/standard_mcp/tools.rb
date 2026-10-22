@@ -49,9 +49,10 @@ module StandardMCP
       },
       DESCRIBE_ATTRIBUTES => {
         title: 'Describe what a resource contains',
-        description: "Describe what a record of a resource contains, as its JSON Schema: each attribute's type, " \
-          'description (from the column comment), enum, default, readOnly and required, and validation ' \
-          'constraints. Pass the where you will use so attributes that depend on it are included.'
+        description: "Describe a resource's records as JSON Schemas: \"read\" is a record as the list and get tools " \
+          'return it and, for callers who may write, "write" is what create and update accept (types, enums, defaults, ' \
+          'readOnly, required and validation constraints). Pass the where you will use so attributes that depend ' \
+          'on it are included.'
       }
     }.freeze
 
@@ -150,7 +151,7 @@ module StandardMCP
 
       # Runs one describe call: the +tool+ ('describe_query' or
       # 'describe_attributes') document of resource +name+ for +where+: the keys
-      # of the query, or the JSON Schema StandardAPI renders for the record. A
+      # of the query, or the read and write JSON Schemas StandardAPI renders. A
       # where that couldn't be used to list or calculate is an error, as it would
       # be there.
       def describe(request, entries, tool, name, where = nil)

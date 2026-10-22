@@ -233,15 +233,24 @@ class ResourcesTest < ActiveSupport::TestCase
 
     assert_equal %w[attributes query], doc.keys.sort
     assert_equal 'properties', doc['query']['resource']
-    assert_equal 'Property', doc['attributes']['title']
+    assert_equal %w[read], doc['attributes'].keys
+    assert_equal 'Property', doc['attributes']['read']['title']
     assert_equal 'A real estate asset owned by an account.', doc['query']['description']
     assert_equal 'size', key(doc['query'], 'size')['name']
-    assert_equal %w[integer null], attribute(doc['attributes'], 'size')['type']
+    assert_equal %w[integer null], attribute(doc['attributes']['read'], 'size')['type']
+  end
+
+  test "the attributes have the write schema for a caller who may create or update" do
+    attributes = document('properties', WRITES)['attributes']
+
+    assert_equal %w[read write], attributes.keys
+    assert_equal 'Property', attributes['write']['title']
+    assert_equal %w[integer null], attributes['write']['properties']['property']['properties']['size']['type']
   end
 
   test "the documents are built for the caller" do
-    assert_equal 'Property', document('properties', WRITES)['attributes']['title']
-    assert_equal 'Contact', document('contacts', WRITES)['attributes']['title']
+    assert_equal 'Property', document('properties', WRITES)['attributes']['read']['title']
+    assert_equal 'Contact', document('contacts', WRITES)['attributes']['read']['title']
     # A write-only caller has no where or order to describe.
     refute document('contacts', WRITES)['query'].key?('where')
     refute document('contacts', WRITES)['query'].key?('order')
@@ -269,7 +278,8 @@ class ResourcesTest < ActiveSupport::TestCase
     StandardMCP::Registry.stubs(:controllers).returns([controller])
 
     doc = document('patchers')
-    refute attribute(doc['attributes'], 'size')['readOnly']
+    assert_equal %w[read write], doc['attributes'].keys
+    assert_equal %w[integer null], doc['attributes']['write']['properties']['property']['properties']['size']['type']
     refute doc['query'].key?('where')
   end
 
@@ -282,7 +292,8 @@ class ResourcesTest < ActiveSupport::TestCase
     entries = StandardMCP::Resources.entries(StandardMCP::Registry.allowed(request))
 
     assert_equal document('properties', WRITES)['query'], StandardMCP::Resources.document(request, entries, 'properties')
-    assert_equal document('properties', WRITES)['attributes'], StandardMCP::Resources.attributes(request, entries, 'properties').structured_content
+    assert_equal document('properties', WRITES)['attributes'],
+      JSON.parse(JSON.generate(StandardMCP::Resources.attributes(request, entries, 'properties').structured_content))
     assert_nil StandardMCP::Resources.document(request, entries, 'nothing')
     assert_nil StandardMCP::Resources.attributes(request, entries, 'nothing')
   end
@@ -299,13 +310,16 @@ class ResourcesTest < ActiveSupport::TestCase
     assert_equal 'size', key(doc, 'size')['name']
   end
 
-  test "the attributes are what the json_schema action renders" do
+  test "the attributes are what the read_schema and write_schema actions render" do
     request = request_for(WRITES)
     entries = StandardMCP::Resources.entries(StandardMCP::Registry.allowed(request))
-    rendered = StandardMCP::Dispatcher.new(request).call(PropertiesController, :json_schema)
+    read = StandardMCP::Dispatcher.new(request).call(PropertiesController, :read_schema)
+    write = StandardMCP::Dispatcher.new(request).call(PropertiesController, :write_schema)
 
-    assert_equal 200, rendered.status
-    assert_equal rendered.json, StandardMCP::Resources.attributes(request, entries, 'properties').structured_content
+    assert_equal 200, read.status
+    assert_equal 200, write.status
+    assert_equal({ read: read.json, write: write.json },
+      StandardMCP::Resources.attributes(request, entries, 'properties').structured_content)
   end
 
   test "a where that doesn't hold up raises" do

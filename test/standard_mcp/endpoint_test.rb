@@ -239,9 +239,9 @@ class EndpointTest < ActionDispatch::IntegrationTest
     doc = read_resource('standardmcp://schema/properties')
 
     assert_equal 'properties', doc['query']['resource']
-    assert_equal 'Property', doc['attributes']['title']
-    assert_equal 'Rentable area in square feet.', doc['attributes']['properties']['size']['description']
-    assert_equal true, doc['attributes']['properties']['id']['readOnly']
+    assert_equal 'Property', doc['attributes']['read']['title']
+    assert_equal 'Rentable area in square feet.', doc['attributes']['read']['properties']['size']['description']
+    assert_equal %w[read], doc['attributes'].keys
   end
 
   test "the schema resource is the two documents the describe tools return" do

@@ -157,15 +157,6 @@ class SchemaInputDefinitionsTest < ActiveSupport::TestCase
     end
   end
 
-  test "the output schema has no format uuid" do
-    model = uuid_model
-    property = { 'type' => 'string', 'format' => 'uuid', 'description' => 'Owner' }
-
-    StandardMCP::Schema::Output.adapt_column(property, model, model.columns_hash['owner_id'])
-
-    assert_equal({ 'type' => ['string', 'null'], 'description' => 'Owner' }, property)
-  end
-
   test "other formats are kept" do
     assert_equal({ 'type' => 'string', 'format' => 'date' }, Input.without_uuid({ 'type' => 'string', 'format' => 'date' }))
     assert_equal({ 'type' => 'string' }, Input.without_uuid({ 'type' => 'string', 'format' => 'uuid' }))

@@ -6,8 +6,8 @@ module StandardMCP
     # attributes the ACL permits (`model_attributes`), typed from the columns,
     # plus the associations the ACL lets a request write through (`nested`).
     #
-    # StandardAPI's json_schema view derives the same from validators and
-    # nullability, but it describes a stored record; this is the INPUT side, so
+    # StandardAPI's write_schema derives the same from the definitions and
+    # validators, for describe_attributes to show; this one checks the call, so
     # only what is safe to enforce before saving is kept:
     #
     # - unconditional validators only (no `if:`/`unless:`, and `on:` must match

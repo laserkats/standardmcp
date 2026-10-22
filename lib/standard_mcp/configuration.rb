@@ -64,7 +64,7 @@ module StandardMCP
     # ACL's `wheres` permit, and the MCP server rejects a bad filter by schema
     # validation. The nested records of create and update are typed from their
     # own ACL too. Deep types real columns only: attributes that depend on the
-    # where (`model_attribute_definitions`) are not in it, and `tools/list`
+    # where (the ACL's `schemas` hook) are not in it, and `tools/list`
     # grows with the models.
     #
     # Accepts a String or Symbol.

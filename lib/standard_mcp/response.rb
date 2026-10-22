@@ -22,14 +22,19 @@ module StandardMCP
       calculate: :result
     }.freeze
 
+    # StandardAPI's `json_schema` action, which backs `describe_attributes`. Not
+    # a tool of its own, so it isn't one of Controller::ACTIONS.
+    JSON_SCHEMA = :json_schema
+
     class << self
       # `result` responds to #status, #headers, #body and #json (see
       # Dispatcher::Result). `extra` is merged into a successful result's
       # structured content, e.g. pagination for index.
       def from(result, action:, extra: nil)
         action = action.respond_to?(:to_sym) ? action.to_sym : action
-        unless Controller::ACTIONS.include?(action)
-          raise ArgumentError, "Unknown action #{action.inspect}. Valid actions: #{Controller::ACTIONS.map(&:inspect).join(', ')}"
+        actions = Controller::ACTIONS + [JSON_SCHEMA]
+        unless actions.include?(action)
+          raise ArgumentError, "Unknown action #{action.inspect}. Valid actions: #{actions.map(&:inspect).join(', ')}"
         end
 
         status = result.status
@@ -57,6 +62,9 @@ module StandardMCP
         structured =
           if action == :destroy
             destroyed(result)
+          elsif action == JSON_SCHEMA
+            # The JSON Schema itself, unwrapped.
+            payload(result, action)
           else
             { KEYS.fetch(action) => payload(result, action) }
           end

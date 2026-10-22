@@ -99,7 +99,7 @@ module StandardMCP
       def describe_sentence(resources)
         name = resources.first.name.tr('/', '_')
         sentence = %(describe_query {"resource": "#{name}"} returns the keys, operators and associations of where, order ) +
-          %(and include; describe_attributes {"resource": "#{name}"} returns a record's attributes and which can be written. ) +
+          %(and include; describe_attributes {"resource": "#{name}"} returns a record's JSON Schema, with which attributes are read only or required. ) +
           'Pass them the where you will use, as some keys depend on it'
         sentence += ' (write a "/" in a resource name as "_")' if resources.any? { |resource| resource.name.include?('/') }
         "#{sentence}."

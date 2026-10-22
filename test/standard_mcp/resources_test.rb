@@ -92,7 +92,7 @@ class ResourcesTest < ActiveSupport::TestCase
   end
 
   def attribute(doc, name)
-    doc['attributes'].find { |a| a['name'] == name } or flunk "no attribute #{name}"
+    doc['properties'][name] or flunk "no attribute #{name}"
   end
 
   def key(doc, name)
@@ -172,7 +172,7 @@ class ResourcesTest < ActiveSupport::TestCase
 
   test "listing renders no schema" do
     StandardMCP::Schema::QueryDocument.expects(:for).never
-    StandardMCP::Schema::AttributesDocument.expects(:for).never
+    StandardMCP::Dispatcher.any_instance.expects(:call).never
 
     templates(WRITES)
   end
@@ -233,20 +233,15 @@ class ResourcesTest < ActiveSupport::TestCase
 
     assert_equal %w[attributes query], doc.keys.sort
     assert_equal 'properties', doc['query']['resource']
-    assert_equal 'properties', doc['attributes']['resource']
+    assert_equal 'Property', doc['attributes']['title']
     assert_equal 'A real estate asset owned by an account.', doc['query']['description']
     assert_equal 'size', key(doc['query'], 'size')['name']
-    assert_equal 'integer', attribute(doc['attributes'], 'size')['type']
+    assert_equal %w[integer null], attribute(doc['attributes'], 'size')['type']
   end
 
   test "the documents are built for the caller" do
-    reads = document('properties')
-    writes = document('properties', WRITES)
-
-    refute(reads['attributes']['attributes'].any? { |a| a['writable'] })
-    assert_equal %w[account_id available built_on description kind name rent size],
-      writes['attributes']['attributes'].select { |a| a['writable'] }.map { |a| a['name'] }.sort
-    assert_equal 'contacts', document('contacts', WRITES)['attributes']['resource']
+    assert_equal 'Property', document('properties', WRITES)['attributes']['title']
+    assert_equal 'Contact', document('contacts', WRITES)['attributes']['title']
     # A write-only caller has no where or order to describe.
     refute document('contacts', WRITES)['query'].key?('where')
     refute document('contacts', WRITES)['query'].key?('order')
@@ -260,12 +255,10 @@ class ResourcesTest < ActiveSupport::TestCase
     refute document('gallery')['query']['include'].first.key?('resource')
   end
 
-  test "hidden columns are absent" do
-    doc = document('gallery')
-
-    refute_includes JSON.generate(doc), 'internal_path'
-    assert_equal %w[id property_id format caption created_at updated_at], doc['attributes']['attributes'].map { |a| a['name'] }
+  test "hidden columns are absent from the query document" do
+    refute_includes JSON.generate(document('gallery')['query']), 'internal_path'
   end
+
 
   test "an update-only caller can write the attributes an update takes" do
     controller = Class.new(ApplicationController) do
@@ -276,33 +269,43 @@ class ResourcesTest < ActiveSupport::TestCase
     StandardMCP::Registry.stubs(:controllers).returns([controller])
 
     doc = document('patchers')
-    assert attribute(doc['attributes'], 'size')['writable']
+    refute attribute(doc['attributes'], 'size')['readOnly']
     refute doc['query'].key?('where')
   end
 
-  test "keys without a value are left out" do
-    %w[accounts properties gallery].each { |resource| assert_compact(document(resource, WRITES)) }
+  test "keys without a value are left out of the query document" do
+    %w[accounts properties gallery].each { |resource| assert_compact(document(resource, WRITES)['query']) }
   end
 
   test "the resource name is the same in the schema resource and the describe tools" do
     request = request_for(WRITES)
     entries = StandardMCP::Resources.entries(StandardMCP::Registry.allowed(request))
 
-    assert_equal document('properties', WRITES), StandardMCP::Resources.document(request, entries, 'properties')
-    assert_equal document('properties', WRITES)['query'], StandardMCP::Resources.document(request, entries, 'properties', kind: 'query')
+    assert_equal document('properties', WRITES)['query'], StandardMCP::Resources.document(request, entries, 'properties')
+    assert_equal document('properties', WRITES)['attributes'], StandardMCP::Resources.attributes(request, entries, 'properties').structured_content
     assert_nil StandardMCP::Resources.document(request, entries, 'nothing')
+    assert_nil StandardMCP::Resources.attributes(request, entries, 'nothing')
   end
 
-  test "the documents are asked of the hook once for a where" do
+  test "the query document asks the definitions once for a where" do
     request = request_for(WRITES)
     entries = StandardMCP::Resources.entries(StandardMCP::Registry.allowed(request))
     where = { 'size' => { 'gte' => 1 } }
-    PropertiesController.any_instance.expects(:model_attribute_definitions).once.with(Property, where)
+    PropertiesController.any_instance.expects(:schemas_for).once.with(Property)
       .returns([{ name: 'size', type: 'integer' }])
 
     doc = StandardMCP::Resources.document(request, entries, 'properties', where: where)
 
-    assert_equal 'size', doc['attributes']['attributes'].first['name']
+    assert_equal 'size', key(doc, 'size')['name']
+  end
+
+  test "the attributes are what the json_schema action renders" do
+    request = request_for(WRITES)
+    entries = StandardMCP::Resources.entries(StandardMCP::Registry.allowed(request))
+    rendered = StandardMCP::Dispatcher.new(request).call(PropertiesController, :json_schema)
+
+    assert_equal 200, rendered.status
+    assert_equal rendered.json, StandardMCP::Resources.attributes(request, entries, 'properties').structured_content
   end
 
   test "a where that doesn't hold up raises" do

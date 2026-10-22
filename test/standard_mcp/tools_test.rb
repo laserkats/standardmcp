@@ -771,7 +771,8 @@ class ToolsTest < ActiveSupport::TestCase
     assert_equal 'Describe what a resource can be queried by', query[:title]
     %w[keys operators associations].each { |word| assert_includes query[:description], word }
     assert_equal 'Describe what a resource contains', attributes[:title]
-    %w[type comment enum written withheld].each { |word| assert_includes attributes[:description], word }
+    ['JSON Schema', 'type', 'enum', 'default', 'readOnly', 'required'].each { |word| assert_includes attributes[:description], word }
+    %w[writable withheld only_in].each { |word| refute_includes attributes[:description], word }
   end
 
   test "the where parameter is generic: it names no group" do
@@ -795,18 +796,27 @@ class ToolsTest < ActiveSupport::TestCase
   test "a resource of the caller is described as the schema resource describes it" do
     request = request_for(WRITES)
     entries = StandardMCP::Resources.entries(StandardMCP::Registry.allowed(request))
-    resource = StandardMCP::Resources.document(request, entries, 'properties')
+    documents = {
+      'describe_query' => StandardMCP::Resources.document(request, entries, 'properties'),
+      'describe_attributes' => StandardMCP::Resources.attributes(request, entries, 'properties').structured_content
+    }
 
-    { 'describe_query' => 'query', 'describe_attributes' => 'attributes' }.each do |name, kind|
+    documents.each do |name, resource|
       result = call_tool(name, { resource: 'properties' }, WRITES)
       document = JSON.parse(JSON.generate(result[:structuredContent]))
 
       refute result[:isError]
       assert_equal document, JSON.parse(result[:content].first[:text])
-      assert_equal 'properties', document['resource']
-      assert_equal resource[kind], document
+      assert_equal resource, document
     end
-    assert structured('describe_attributes', { resource: 'properties' }, WRITES)[:attributes].any? { |a| a[:writable] }
+    assert_equal 'properties', structured('describe_query', { resource: 'properties' }, WRITES)[:resource]
+    assert_equal 'Property', structured('describe_attributes', { resource: 'properties' }, WRITES)[:title]
+  end
+
+  test "describe_attributes is the JSON Schema the json_schema action renders" do
+    rendered = StandardMCP::Dispatcher.new(request_for).call(PropertiesController, :json_schema).json
+
+    assert_equal rendered, JSON.parse(JSON.generate(structured('describe_attributes', { resource: 'properties' })))
   end
 
   test "a namespaced resource is written with underscores" do
@@ -814,7 +824,7 @@ class ToolsTest < ActiveSupport::TestCase
 
     assert_equal 'admin_accounts', document[:resource]
     assert document.key?(:where)
-    assert_equal 'admin_accounts', structured('describe_attributes', { resource: 'admin_accounts' }, 'X-MCP-Admin' => 'true')[:resource]
+    assert_equal 'Account', structured('describe_attributes', { resource: 'admin_accounts' }, 'X-MCP-Admin' => 'true')[:title]
   end
 
   test "a hidden resource is not in the enum and can't be described" do
@@ -828,14 +838,19 @@ class ToolsTest < ActiveSupport::TestCase
     end
   end
 
-  test "a where is passed to the definitions hook, and a bad one is an error" do
+  test "a where is dispatched to json_schema as params[:where]" do
     where = { size: { gte: 1 } }
-    PropertiesController.any_instance.expects(:model_attribute_definitions).once.with(Property, { 'size' => { 'gte' => 1 } })
-      .returns([{ name: 'size', type: 'integer' }])
+    StandardMCP::Dispatcher.any_instance.expects(:call).with(PropertiesController, :json_schema, { 'where' => { 'size' => { 'gte' => 1 } } })
+      .returns(StandardMCP::Dispatcher::Result.new(status: 200, headers: {}, body: '{"title":"Property"}'))
 
-    document = structured('describe_attributes', { resource: 'properties', where: where })
+    assert_equal({ title: 'Property' }, structured('describe_attributes', { resource: 'properties', where: where }))
+  end
 
-    assert_equal %w[size], document[:attributes].map { |a| a[:name] }
+  test "describe_attributes dispatches json_schema with no where when none is given, and never an include" do
+    StandardMCP::Dispatcher.any_instance.expects(:call).with(PropertiesController, :json_schema, {})
+      .returns(StandardMCP::Dispatcher::Result.new(status: 200, headers: {}, body: '{"title":"Property"}'))
+
+    structured('describe_attributes', { resource: 'properties' })
   end
 
   test "a where that couldn't list is an error from either describe tool" do

@@ -7,8 +7,8 @@ module StandardMCP
     # read (no JSON Schema keywords; empty values and false flags are left out).
     #
     # The keys of `where` are what the ACL's `wheres` permit, which are
-    # attributes (columns, or the where-dependent definitions of
-    # `model_attribute_definitions`), `filter_on` filters and other names
+    # attributes (columns, or the where-dependent definitions of the ACL's
+    # `schemas` hook), `filter_on` filters and other names
     # permitted as they are. A column the ACL doesn't permit can't be filtered
     # on and isn't listed. Operators are given once per type; a key whose ACL
     # entry lists operators carries its own list. Associations are named with the
@@ -57,7 +57,6 @@ module StandardMCP
           {
             'resource' => name,
             'description' => Description.table(model),
-            'groups' => definitions.groups,
             'where' => ((actions & %i[index calculate]).any? ? where_section(controller, model, definitions, links) : nil),
             'order' => (actions.include?(:index) ? order_section(controller, model, definitions, links) : nil),
             'include' => ((actions & %i[index show create update]).any? ? include_section(controller, model, links) : nil)
@@ -117,6 +116,7 @@ module StandardMCP
           key['types'] = definition['types']
           key['enum'] = Input.definition_enum(model, definition)
           key['description'] = definition['comment'].presence || Description.column(model, name)
+          # Passed through when the app's definition carries them.
           key['only_in'] = definition['only_in']
 
           tables = operator_tables(model, definition)

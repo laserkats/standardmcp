@@ -35,14 +35,19 @@ class QueryDocGroupedController < ApplicationController
     [:id, :x]
   end
 
-  def model_attribute_definitions(model, where)
-    ids = where.is_a?(Hash) && where.dig('id', 'in')
+  # The app's `schemas` hook, which reads params[:where], labels the groups
+  # itself with only_in and types.
+  def schemas_for(model)
+    where = params[:where]
+    ids = where.is_a?(ActionController::Parameters) && where.dig('id', 'in')
     return [{ name: 'id', type: 'integer' }, { name: 'z', type: 'boolean', comment: 'Only this one.' }] unless ids
 
-    {
-      'Group A' => [{ name: 'id', type: 'integer' }, { name: 'x', type: 'integer' }, { name: 'y', type: 'string', comment: 'A y.' }],
-      'Group B' => [{ name: 'id', type: 'integer' }, { name: 'x', type: 'string' }, { name: 'z', type: 'boolean' }]
-    }
+    [
+      { name: 'id', type: 'integer' },
+      { name: 'x', types: { 'Group A' => 'integer', 'Group B' => 'string' } },
+      { name: 'y', type: 'string', comment: 'A y.', only_in: ['Group A'] },
+      { name: 'z', type: 'boolean', only_in: ['Group B'] }
+    ]
   end
 end
 
@@ -56,7 +61,7 @@ class QueryDocPartialController < ApplicationController
     [:id, :size, :custom]
   end
 
-  def model_attribute_definitions(model, where)
+  def schemas_for(model)
     [{ name: 'id', type: 'integer' }, { name: 'custom', type: 'datetime', comment: 'Custom stamp.' }, { name: 'hidden_by_acl', type: 'string' }]
   end
 end
@@ -360,11 +365,11 @@ class SchemaQueryDocumentTest < ActiveSupport::TestCase
 
   # --- definitions that depend on the where
 
-  test "the hook is asked once, for the where the agent will use" do
+  test "schemas_for is asked once, for the where the agent will use" do
     where = { 'id' => { 'in' => [1, 2] } }
     klass = Class.new(QueryDocGroupedController) { def property_wheres = [:x] }
     controller = StandardMCP::Registry.controller_for(klass, request_for)
-    controller.expects(:model_attribute_definitions).once.with(Property, where).returns([{ name: 'x', type: 'integer' }])
+    klass.any_instance.expects(:schemas_for).once.with(Property).returns([{ name: 'x', type: 'integer' }])
 
     document = StandardMCP::Schema::QueryDocument.for(controller, name: 'properties', actions: READS, where: where)
 
@@ -374,8 +379,8 @@ class SchemaQueryDocumentTest < ActiveSupport::TestCase
   test "a document built from definitions the caller already has asks no more" do
     klass = Class.new(QueryDocGroupedController) { def property_wheres = [:x] }
     controller = StandardMCP::Registry.controller_for(klass, request_for)
-    controller.expects(:model_attribute_definitions).never
-    definitions = StandardMCP::Schema::Definitions::Result.new(entries: [{ 'name' => 'x', 'type' => 'integer' }], groups: nil)
+    klass.any_instance.expects(:schemas_for).never
+    definitions = StandardMCP::Schema::Definitions::Result.new(entries: [{ 'name' => 'x', 'type' => 'integer' }])
 
     document = StandardMCP::Schema::QueryDocument.for(controller, name: 'properties', actions: READS, definitions: definitions)
 
@@ -392,10 +397,10 @@ class SchemaQueryDocumentTest < ActiveSupport::TestCase
     refute document.key?('groups')
   end
 
-  test "a where over several groups returns every key, labelled" do
+  test "labels the app's definitions carry are passed through onto the keys" do
     document = doc(QueryDocGroupedController, where: { 'id' => { 'in' => [1, 2] } })
 
-    assert_equal ['Group A', 'Group B'], document['groups']
+    refute document.key?('groups')
     assert_equal %w[id x y z], keys(document)
     assert_equal({ 'name' => 'id', 'type' => 'integer' }, key(document, 'id'))
     assert_equal({ 'name' => 'x', 'types' => { 'Group A' => 'integer', 'Group B' => 'string' } }, key(document, 'x'))

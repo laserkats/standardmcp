@@ -84,7 +84,9 @@ class SchemaInputDefinitionsTest < ActiveSupport::TestCase
 
     assert_equal({ 'type' => %w[integer null] }, schemas.({ name: 'x', type: 'integer' })['eq'])
     assert_equal({ 'type' => 'array', 'items' => { 'type' => 'integer' } }, schemas.({ name: 'x', type: 'integer' })['in'])
-    assert_equal({ 'type' => 'number' }, schemas.({ name: 'x', type: 'decimal' })['gt'])
+    assert_equal({ 'type' => 'number' }, schemas.({ name: 'x', type: 'float' })['gt'])
+    # StandardAPI's json_schema_for_type: a BigDecimal renders as a String, and either is accepted.
+    assert_equal({ 'type' => %w[number string] }, schemas.({ name: 'x', type: 'decimal' })['gt'])
     assert_equal({ 'type' => 'string', 'format' => 'date' }, schemas.({ name: 'x', type: 'date' })['gt'])
     assert_equal({ 'type' => 'string', 'format' => 'date-time' }, schemas.({ name: 'x', type: 'datetime' })['lt'])
     assert_equal({ 'type' => 'string' }, schemas.({ name: 'x', type: 'string' })['gte'])

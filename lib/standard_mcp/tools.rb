@@ -49,17 +49,17 @@ module StandardMCP
       },
       DESCRIBE_ATTRIBUTES => {
         title: 'Describe what a resource contains',
-        description: "Describe what a record of a resource contains, for reads and writes: each attribute's type, " \
-          'comment and enum, whether it can be written or must be sent, and whether it can be withheld for privacy. ' \
-          'Pass the where you will use so attributes that depend on it are included.'
+        description: "Describe what a record of a resource contains, as its JSON Schema: each attribute's type, " \
+          'description (from the column comment), enum, default, readOnly and required, and validation ' \
+          'constraints. Pass the where you will use so attributes that depend on it are included.'
       }
     }.freeze
 
     WHERE_PARAMETER = {
       type: %w[object array],
-      description: 'Optional. The where you will use to list records, because some keys depend on it. A where ' \
-        'that spans several groups returns every key, with only_in where a key exists in only some groups and ' \
-        'types where its type differs.'
+      description: 'Optional. The where you will use to list records, because some attributes and keys depend ' \
+        'on it. describe_query marks a key only_in the groups that have it, or with its types per group, ' \
+        'when the app says so.'
     }.freeze
 
     # MCP spec: 1-64 characters. (The mcp gem allows 128.)
@@ -149,12 +149,19 @@ module StandardMCP
       end
 
       # Runs one describe call: the +tool+ ('describe_query' or
-      # 'describe_attributes') document of resource +name+ for +where+. A where
-      # that couldn't be used to list or calculate is an error, as it would be there.
+      # 'describe_attributes') document of resource +name+ for +where+: the keys
+      # of the query, or the JSON Schema StandardAPI renders for the record. A
+      # where that couldn't be used to list or calculate is an error, as it would
+      # be there.
       def describe(request, entries, tool, name, where = nil)
-        kind = tool.delete_prefix('describe_')
         where = JSON.parse(JSON.generate(where)) unless where.nil?
-        document = Resources.document(request, entries, name.to_s, where: where, kind: kind)
+
+        if tool == DESCRIBE_ATTRIBUTES
+          response = Resources.attributes(request, entries, name.to_s, where)
+          return response || Response.error("Unknown resource #{name.to_s.inspect}")
+        end
+
+        document = Resources.document(request, entries, name.to_s, where: where)
         return Response.error("Unknown resource #{name.to_s.inspect}") unless document
 
         MCP::Tool::Response.new([{ type: 'text', text: JSON.generate(document) }], structured_content: document)

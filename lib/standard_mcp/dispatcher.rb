@@ -34,7 +34,8 @@ module StandardMCP
       calculate: 'GET',
       create: 'POST',
       update: 'PATCH',
-      destroy: 'DELETE'
+      destroy: 'DELETE',
+      json_schema: 'GET'
     }.freeze
 
     # Env entries copied verbatim from the MCP request when present.
@@ -87,9 +88,15 @@ module StandardMCP
     end
 
     # Whether +call+ would let +action+ through, for work that must only
-    # happen once it is allowed (call still checks).
+    # happen once it is allowed (call still checks). `json_schema`, which backs
+    # `describe_attributes`, is allowed with any allowed action on the
+    # controller: the condition under which the describe tools list it.
     def allowed?(klass, action)
-      METHODS.key?(action.to_sym) && Registry.controller_for(klass, request).mcp_actions_allowed.include?(action.to_sym)
+      action = action.to_sym
+      return false unless METHODS.key?(action)
+
+      allowed = Registry.controller_for(klass, request).mcp_actions_allowed
+      action == :json_schema ? allowed.any? : allowed.include?(action)
     end
 
     private
@@ -103,6 +110,8 @@ module StandardMCP
     end
 
     def perform(klass, action, params)
+      # The action doesn't check `include` against the ACL, so none goes in.
+      params = params.except('include') if action == :json_schema
       id = params.delete('id')
       env = build_env(klass, action, params, id)
 

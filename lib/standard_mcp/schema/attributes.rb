@@ -360,10 +360,6 @@ module StandardMCP
             { 'description' => description }.merge(Input.nullable(object))
           end
         end
-
-        # Shared with Schema::AttributesDocument, which flags the writable
-        # attributes.
-        public :writable?, :timestamps, :required_foreign_keys
       end
     end
   end

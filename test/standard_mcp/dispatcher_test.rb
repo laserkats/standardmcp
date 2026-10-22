@@ -27,6 +27,22 @@ class DispatcherFlagController < ApplicationController
   end
 end
 
+# Records the where its ACL's schemas hook saw.
+class DispatcherSchemaController < ApplicationController
+  allow_mcp only: [:index]
+
+  cattr_accessor :seen
+
+  def self.model
+    Property
+  end
+
+  def property_schemas(schemas)
+    self.class.seen = params[:where]&.to_unsafe_h
+    schemas
+  end
+end
+
 class DispatcherTest < ActiveSupport::TestCase
 
   def request_for(headers = {}, env = {})
@@ -251,7 +267,7 @@ class DispatcherTest < ActiveSupport::TestCase
   end
 
   test "HTTP methods follow the action" do
-    assert_equal({ index: 'GET', show: 'GET', calculate: 'GET', create: 'POST', update: 'PATCH', destroy: 'DELETE' },
+    assert_equal({ index: 'GET', show: 'GET', calculate: 'GET', create: 'POST', update: 'PATCH', destroy: 'DELETE', json_schema: 'GET' },
       StandardMCP::Dispatcher::METHODS)
   end
 
@@ -381,8 +397,62 @@ class DispatcherTest < ActiveSupport::TestCase
     assert dispatcher.allowed?(ContactsController, 'create')
     refute dispatcher.allowed?(ContactsController, :index)
     refute dispatcher.allowed?(PropertiesController, :destroy)
-    refute dispatcher.allowed?(ContactsController, :json_schema)
     refute StandardMCP::Dispatcher.new(request_for).allowed?(ContactsController, :create)
+  end
+
+  # --- json_schema
+
+  test "json_schema renders the JSON Schema of the model" do
+    result = dispatch(AccountsController, :json_schema)
+
+    assert_equal 200, result.status
+    assert_equal 'Account', result.json['title']
+    assert_equal 'object', result.json['type']
+    assert_equal %w[id name status notes created_at updated_at], result.json['properties'].keys
+    assert_equal true, result.json['properties']['id']['readOnly']
+  end
+
+  test "json_schema is allowed with any allowed action on the controller" do
+    assert StandardMCP::Dispatcher.new(request_for).allowed?(AccountsController, :json_schema)
+    assert StandardMCP::Dispatcher.new(request_for(writes)).allowed?(ContactsController, :json_schema)
+    # The schema is reachable by a caller who can only write.
+    assert_equal 200, dispatch(ContactsController, :json_schema, {}, writes).status
+  end
+
+  test "json_schema is refused for a controller the caller has no action on" do
+    refute StandardMCP::Dispatcher.new(request_for).allowed?(ContactsController, :json_schema)
+    refute StandardMCP::Dispatcher.new(request_for).allowed?(ApplicationController, :json_schema)
+
+    error = assert_raises(StandardMCP::ActionNotAllowed) { dispatch(ContactsController, :json_schema) }
+    assert_equal 'json_schema is not allowed on ContactsController', error.message
+  end
+
+  test "json_schema re-checks allow_mcp on every call" do
+    request = request_for(writes)
+    dispatcher = StandardMCP::Dispatcher.new(request)
+    assert_equal 200, dispatcher.call(ContactsController, :json_schema).status
+
+    request.headers['X-MCP-Writes'] = 'false'
+    assert_raises(StandardMCP::ActionNotAllowed) { dispatcher.call(ContactsController, :json_schema) }
+  end
+
+  test "json_schema takes no include" do
+    result = dispatch(AccountsController, :json_schema, { 'include' => { 'properties' => true } })
+
+    assert_equal 200, result.status
+    assert_equal %w[id name status notes created_at updated_at], result.json['properties'].keys
+  end
+
+  test "json_schema reads the where from the params" do
+    DispatcherSchemaController.seen = nil
+
+    dispatch(DispatcherSchemaController, :json_schema, { 'where' => { 'account_id' => 1 } })
+
+    assert_equal({ 'account_id' => 1 }, DispatcherSchemaController.seen)
+  end
+
+  test "an action that is not one of the actions or json_schema is not allowed" do
+    refute StandardMCP::Dispatcher.new(request_for).allowed?(AccountsController, :tables)
   end
 
   # --- StandardAPI error responses

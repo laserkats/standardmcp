@@ -39,14 +39,15 @@ class McpOnlyAccountsController < ApplicationController
   allow_mcp only: [:index], if: :mcp_request?
 end
 
-# The ACL's schemas hook marks a definition withheld.
+# The ACL's schemas hook asks whether the request is MCP's.
 class McpWithheldPropertiesController < ApplicationController
   def self.model
     Property
   end
 
+  # An ACL `schemas` hook that tells MCP requests from the app's own.
   def property_schemas(schemas)
-    schemas.map { |schema| schema[:name] == 'rent' ? schema.merge(withheld: true) : schema }
+    schemas.map { |schema| schema[:name] == 'rent' && mcp_request? ? schema.merge(comment: 'Seen by MCP') : schema }
   end
 end
 
@@ -184,21 +185,18 @@ class ControllerTest < ActiveSupport::TestCase
     refute McpOnlyAccountsController.new.tap { |c| c.set_request!(request) }.mcp_request?
   end
 
-  # --- model_attribute_definitions
+  # --- the ACL's schemas hook
 
-  test "model_attribute_definitions is StandardAPI's schemas_for by default, whatever the where" do
-    controller = instance_for(PropertiesController)
-
-    assert_equal controller.schemas_for(Property), controller.model_attribute_definitions(Property, nil)
-    assert_equal controller.schemas_for(Property), controller.model_attribute_definitions(Property, { 'size' => { 'gte' => 1 } })
-    assert_equal Property.attribute_names, controller.model_attribute_definitions(Property, nil).map { |d| d[:name] }
-  end
-
-  test "model_attribute_definitions goes through the ACL's schemas hook" do
+  test "an ACL schemas hook can tell an MCP request from the app's own" do
     controller = instance_for(McpWithheldPropertiesController)
-    rent = controller.model_attribute_definitions(Property, nil).find { |definition| definition[:name] == 'rent' }
+    rent = controller.schemas_for(Property).find { |definition| definition[:name] == 'rent' }
 
-    assert_equal true, rent[:withheld]
+    assert_equal 'Seen by MCP', rent[:comment]
+
+    plain = McpWithheldPropertiesController.new
+    plain.set_request!(ActionDispatch::Request.new(Rack::MockRequest.env_for('/')))
+    refute plain.mcp_request?
+    refute_equal 'Seen by MCP', plain.schemas_for(Property).find { |definition| definition[:name] == 'rent' }[:comment]
   end
 
 end

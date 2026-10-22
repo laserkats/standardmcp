@@ -239,10 +239,9 @@ class EndpointTest < ActionDispatch::IntegrationTest
     doc = read_resource('standardmcp://schema/properties')
 
     assert_equal 'properties', doc['query']['resource']
-    assert_equal 'properties', doc['attributes']['resource']
-    assert_equal 'Rentable area in square feet.', doc['attributes']['attributes'].find { |a| a['name'] == 'size' }['description']
-    refute(doc['attributes']['attributes'].any? { |a| a['writable'] })
-    assert(read_resource('standardmcp://schema/properties', headers: WRITES)['attributes']['attributes'].any? { |a| a['writable'] })
+    assert_equal 'Property', doc['attributes']['title']
+    assert_equal 'Rentable area in square feet.', doc['attributes']['properties']['size']['description']
+    assert_equal true, doc['attributes']['properties']['id']['readOnly']
   end
 
   test "the schema resource is the two documents the describe tools return" do
@@ -310,7 +309,7 @@ class EndpointTest < ActionDispatch::IntegrationTest
 
   test "resources/templates/list builds every template and renders no schema" do
     StandardMCP::Schema::QueryDocument.expects(:for).never
-    StandardMCP::Schema::AttributesDocument.expects(:for).never
+    StandardMCP::Dispatcher.any_instance.expects(:call).never
 
     assert_equal 3, template_uris.size
   end

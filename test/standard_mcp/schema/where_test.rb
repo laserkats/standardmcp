@@ -326,7 +326,7 @@ class SchemaWhereTest < ActiveSupport::TestCase
     klass = anonymous(Property) do
       def property_wheres = [:id, :custom_score, :custom_label]
 
-      def model_attribute_definitions(model, where)
+      def schemas_for(model)
         [{ name: 'custom_score', type: 'integer' }, { name: 'custom_label', type: 'string', enum: %w[a b] }]
       end
     end
@@ -341,7 +341,7 @@ class SchemaWhereTest < ActiveSupport::TestCase
     klass = anonymous(Property) do
       def property_wheres = [:id]
 
-      def model_attribute_definitions(model, where)
+      def schemas_for(model)
         [{ name: 'custom_score', type: 'integer' }]
       end
     end
@@ -349,29 +349,43 @@ class SchemaWhereTest < ActiveSupport::TestCase
     assert_match(/\AUnknown filter key 'custom_score'/, errors(klass, { 'custom_score' => { 'gte' => 1 } }).first)
   end
 
-  test "the hook gets the where as passed, once per check" do
+  test "schemas_for runs once per check, on a controller whose params hold the where" do
     where = { 'size' => { 'gte' => 1 }, 'name' => { 'eq' => 'a' }, 'account' => { 'name' => { 'eq' => 'b' } } }
     controller = controller(PropertiesController)
-    controller.expects(:model_attribute_definitions).once.with(Property, where).returns([{ name: 'size', type: 'integer' }, { name: 'name', type: 'string' }])
+    PropertiesController.any_instance.expects(:schemas_for).once.with(Property).returns([{ name: 'size', type: 'integer' }, { name: 'name', type: 'string' }])
 
     assert_equal [], StandardMCP::Schema::Where.errors(controller, where)
   end
 
-  test "the hook is not asked for a where that has no shape" do
+  test "the where reaches the params the definitions are read with" do
+    where = { 'size' => { 'gte' => 1 } }
+    seen = nil
+    klass = anonymous(Property) do
+      define_method(:schemas_for) do |_model|
+        seen = params[:where].to_unsafe_h
+        [{ name: 'size', type: 'integer' }]
+      end
+    end
+
+    assert_equal [], errors(klass, where)
+    assert_equal where, seen
+  end
+
+  test "schemas_for is not asked for a where that has no shape" do
     controller = controller(PropertiesController)
-    controller.expects(:model_attribute_definitions).never
+    PropertiesController.any_instance.expects(:schemas_for).never
 
     assert_match(/must alternate/, StandardMCP::Schema::Where.errors(controller, [{}, {}]).first)
     assert_match(/must be an object of keys, got 5/, StandardMCP::Schema::Where.errors(controller, 5).first)
     assert_equal [], StandardMCP::Schema::Where.errors(controller, nil)
   end
 
-  test "a grouped definition with differing types takes the operators of any of them" do
+  test "a definition with a type for each group takes the operators of any of them" do
     klass = anonymous(Property) do
       def property_wheres = [:id, :x]
 
-      def model_attribute_definitions(model, where)
-        { 'A' => [{ name: 'x', type: 'integer' }], 'B' => [{ name: 'x', type: 'string' }] }
+      def schemas_for(model)
+        [{ name: 'x', types: { 'A' => 'integer', 'B' => 'string' } }]
       end
     end
 
@@ -521,7 +535,6 @@ class SchemaWhereTest < ActiveSupport::TestCase
     definitions = StandardMCP::Schema::Where.checked_definitions(controller(PropertiesController), { 'size' => { 'gte' => 1 } })
 
     assert_includes definitions.names, 'size'
-    assert_nil definitions.groups
   end
 
   test "checked_definitions raises Invalid with the messages of a where that does not" do

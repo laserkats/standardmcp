@@ -7,8 +7,8 @@ module StandardMCP
   # - `standardmcp://schema/{resource}`: what a controller's model offers this
   #   caller, as `{ "query": ..., "attributes": ... }`: the documents the
   #   `describe_query` and `describe_attributes` tools return for no where
-  #   (Schema::QueryDocument, Schema::AttributesDocument), which the shallow tool
-  #   schemas leave out. `resource` is the controller path with `/` written as `_`
+  #   (Schema::QueryDocument, and the JSON Schema of StandardAPI's `json_schema`
+  #   action), which the shallow tool schemas leave out. `resource` is the controller path with `/` written as `_`
   #   (`admin_accounts`), the segment the tool names use, so it needs no `/`
   #   (a `{var}` of the mcp gem matches one path segment, and nothing is
   #   percent-decoded).
@@ -94,34 +94,49 @@ module StandardMCP
         entries.each_with_object({}) { |entry, result| result[entry.klass.model] ||= entry.name }
       end
 
-      # The documents of resource +name+ for +request+ (a Hash keyed 'query' and
-      # 'attributes', or just the +kind+ asked for, which is a String), or nil
+      # The query document of resource +name+ for +request+ (a Hash), or nil
       # when the caller has no allowed action on that controller (or none
       # exists). +entries+ is `entries(Registry.allowed(request))`. +where+ is
       # the where the keys depend on; the definitions are asked for it once. A
       # where that doesn't hold up raises Schema::Where::Invalid.
-      def document(request, entries, name, where: nil, kind: nil)
+      def document(request, entries, name, where: nil)
         entry = entries.find { |candidate| candidate.name == name }
         return unless entry
 
         controller = Registry.controller_for(entry.klass, request)
         definitions = Schema::Where.checked_definitions(controller, where)
-        options = { name: entry.name, actions: entry.actions, links: links(entries), where: where, definitions: definitions }
-        query = -> { Schema::QueryDocument.for(controller, **options) }
-        attributes = -> { Schema::AttributesDocument.for(controller, **options) }
+        Schema::QueryDocument.for(controller, name: entry.name, actions: entry.actions, links: links(entries),
+          where: where, definitions: definitions)
+      end
 
-        case kind
-        when 'query' then query.call
-        when 'attributes' then attributes.call
-        else { 'query' => query.call, 'attributes' => attributes.call }
-        end
+      # The attributes of resource +name+ as the JSON Schema StandardAPI's
+      # `json_schema` action renders for +where+, unchanged, as a Response (an
+      # error result when the action answers 4xx; a 5xx raises). nil when the
+      # caller has no allowed action on that controller (or none exists). The
+      # action runs in-process like a tool call, so the callbacks and the ACL's
+      # `schemas` hook (which reads `params[:where]`) run too. A where that
+      # doesn't hold up raises Schema::Where::Invalid.
+      def attributes(request, entries, name, where = nil)
+        entry = entries.find { |candidate| candidate.name == name }
+        return unless entry
+
+        errors = Schema::Where.errors(Registry.controller_for(entry.klass, request), where)
+        raise Schema::Where::Invalid, errors if errors.any?
+
+        result = Dispatcher.new(request).call(entry.klass, :json_schema, { 'where' => where }.compact)
+        Response.from(result, action: :json_schema)
+      rescue ActionNotAllowed
+        nil
       end
 
       # Runs one schema read (public: the template body is a block evaluated
       # on the template class, which can't reach private methods here).
       def read_schema(request, entries, name, uri)
-        found = document(request, entries, name) or raise not_found(uri)
-        text(uri, found)
+        query = document(request, entries, name) or raise not_found(uri)
+        response = attributes(request, entries, name) or raise not_found(uri)
+        raise invalid(response.structured_content[:error]) if response.error?
+
+        text(uri, { 'query' => query, 'attributes' => response.structured_content })
       end
 
       # Runs one record read. +id+ is the URI's id, as given.
@@ -180,8 +195,8 @@ module StandardMCP
           name: 'schema',
           title: 'Resource schema',
           description: 'What a resource offers: "query" has the keys and operators of where, the order keys and the ' \
-            'associations to include; "attributes" has the types, comments, enums and flags (writable, required, ' \
-            "withheld) of a record. Resources: #{names.join(', ')}.",
+            'associations to include; "attributes" is the JSON Schema of a record (types, descriptions, enums, ' \
+            "defaults, readOnly, required). Resources: #{names.join(', ')}.",
           mime_type: MIME_TYPE
         ) do |resource:, server_context: nil|
           Resources.read_schema(request, entries, resource, "#{base}/#{resource}")
